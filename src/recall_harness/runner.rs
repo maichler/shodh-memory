@@ -26,7 +26,7 @@ use super::fixtures::{
 use super::metrics::Metrics;
 use super::report::{
     aggregate_category, aggregate_layer, median, CategoryReport, Failure, LayerReport,
-    PerCaseRecord, Report, SMOKE_K,
+    PerCaseRecord, ReachabilityCategory, ReachabilityReport, Report, SMOKE_K,
 };
 
 /// Embedder identifier emitted in the report. Matches the model wired into
@@ -682,6 +682,162 @@ pub fn ingest_corpus(
         map.insert(item.id.clone(), memory_id.0);
     }
     Ok(map)
+}
+
+/// Graph-reachability diagnostic — see [`ReachabilityReport`].
+///
+/// Ingests the corpus through the production graph-building path (identical to
+/// the recall run), then for every case performs a pure breadth-first topology
+/// walk from the query's seed entities over entity→entity relationships,
+/// collecting the episodes attached to each entity at each depth. A gold memory
+/// is "reachable within h hops" if its uuid appears among the episodes of any
+/// entity within h relationship-hops of a seed entity. Activation weights, tier
+/// trust, and the prune threshold are deliberately IGNORED: this measures
+/// whether an associative PATH exists, not whether the current scoring would
+/// traverse it. `within_2` (one bridge entity) is the canonical double-hop
+/// signal for multi_hop.
+pub fn analyze_graph_reachability(inputs: &RunInputs) -> Result<ReachabilityReport> {
+    pin_harness_threads();
+    const MAX_HOPS: usize = 3;
+    // Safety valve against hub-entity blowup on dense graphs. Far above any
+    // LoCoMo component size, so it does not bias the result in practice.
+    const MAX_VISITED_ENTITIES: usize = 50_000;
+
+    let corpus_path = inputs
+        .corpus_path
+        .clone()
+        .unwrap_or_else(|| fixtures::manifest_path(SMOKE_CORPUS_PATH));
+    let cases_path = inputs
+        .cases_path
+        .clone()
+        .unwrap_or_else(|| fixtures::manifest_path(SMOKE_CASES_PATH));
+    let corpus = fixtures::load_corpus(&corpus_path)
+        .with_context(|| format!("loading corpus from {}", corpus_path.display()))?;
+    let cases = fixtures::load_smoke_cases(&cases_path)
+        .with_context(|| format!("loading cases from {}", cases_path.display()))?;
+    fixtures::validate_structure(&corpus, &cases)
+        .with_context(|| format!("{} suite failed structural validation", inputs.suite))?;
+
+    let manager = build_manager(&inputs.storage_path)?;
+    let id_map = ingest_corpus(&manager, &corpus)?;
+    let ner = manager.get_neural_ner();
+    let graph = manager.get_user_graph(EVAL_USER)?;
+
+    let mut by_category: BTreeMap<String, ReachabilityCategory> = BTreeMap::new();
+    let mut overall = ReachabilityCategory::default();
+
+    for case in &cases {
+        let cat = by_category
+            .entry(category_name(case.category).to_string())
+            .or_default();
+        cat.cases += 1;
+        overall.cases += 1;
+
+        // Gold memory uuids for this case.
+        let gold: HashSet<Uuid> = case
+            .relevant
+            .iter()
+            .filter_map(|r| id_map.get(&r.corpus_item_id).copied())
+            .collect();
+        cat.gold_total += gold.len();
+        overall.gold_total += gold.len();
+
+        // Seed entities: NER over the query text, resolved to graph nodes by
+        // name (same name-keyed lookup the ingest path builds them under).
+        let seed_names: Vec<String> = match ner.extract(&case.query) {
+            Ok(es) => es.into_iter().map(|e| e.text).collect(),
+            Err(_) => Vec::new(),
+        };
+        let g = graph.read();
+        let mut seed_uuids: HashSet<Uuid> = HashSet::new();
+        for name in &seed_names {
+            if let Ok(Some(ent)) = g.find_entity_by_name(name) {
+                seed_uuids.insert(ent.uuid);
+            }
+        }
+        if seed_uuids.is_empty() {
+            cat.cases_no_seed += 1;
+            overall.cases_no_seed += 1;
+            cat.unreachable += gold.len();
+            overall.unreachable += gold.len();
+            continue;
+        }
+
+        // BFS over entity→entity edges; record the min hop at which each gold
+        // episode is first attached to a reached entity.
+        let mut visited: HashSet<Uuid> = seed_uuids.clone();
+        let mut frontier: Vec<Uuid> = seed_uuids.iter().copied().collect();
+        let mut gold_min_hop: HashMap<Uuid, usize> = HashMap::new();
+        for hop in 1..=MAX_HOPS {
+            for ent in &frontier {
+                if let Ok(eps) = g.get_episodes_by_entity(ent) {
+                    for ep in eps {
+                        if gold.contains(&ep.uuid) {
+                            gold_min_hop.entry(ep.uuid).or_insert(hop);
+                        }
+                    }
+                }
+            }
+            if hop == MAX_HOPS || gold_min_hop.len() == gold.len() {
+                break;
+            }
+            let mut next: Vec<Uuid> = Vec::new();
+            for ent in &frontier {
+                if let Ok(edges) = g.get_entity_relationships(ent) {
+                    for e in edges {
+                        for nbr in [e.from_entity, e.to_entity] {
+                            if nbr != *ent && visited.insert(nbr) {
+                                next.push(nbr);
+                            }
+                        }
+                    }
+                }
+                if visited.len() >= MAX_VISITED_ENTITIES {
+                    break;
+                }
+            }
+            frontier = next;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+        drop(g);
+
+        for gid in &gold {
+            match gold_min_hop.get(gid).copied() {
+                Some(1) => {
+                    cat.reachable_within_1 += 1;
+                    cat.reachable_within_2 += 1;
+                    cat.reachable_within_3 += 1;
+                    overall.reachable_within_1 += 1;
+                    overall.reachable_within_2 += 1;
+                    overall.reachable_within_3 += 1;
+                }
+                Some(2) => {
+                    cat.reachable_within_2 += 1;
+                    cat.reachable_within_3 += 1;
+                    overall.reachable_within_2 += 1;
+                    overall.reachable_within_3 += 1;
+                }
+                Some(_) => {
+                    cat.reachable_within_3 += 1;
+                    overall.reachable_within_3 += 1;
+                }
+                None => {
+                    cat.unreachable += 1;
+                    overall.unreachable += 1;
+                }
+            }
+        }
+    }
+
+    Ok(ReachabilityReport {
+        suite: inputs.suite.clone(),
+        git_sha: inputs.git_sha.clone(),
+        max_hops: MAX_HOPS,
+        overall,
+        by_category,
+    })
 }
 
 /// Map a corpus item's `memory_type` string to an `ExperienceType` variant.

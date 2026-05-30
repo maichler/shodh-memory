@@ -30,6 +30,10 @@ on:
         description: 'Diagnostic cutoff: fetch this many results so per-case recall@50/@100 are meaningful (blank/10 = normal). Use 100 to split ranking vs retrieval-reach.'
         required: false
         default: ''
+      reachability:
+        description: 'Graph-reachability diagnostic: set true to skip the recall run and instead report, per category, how much gold is reachable from query seed entities within N entity-hops (pure topology).'
+        required: false
+        default: 'false'
 
 permissions:
   contents: read
@@ -74,7 +78,30 @@ jobs:
       - name: Build recall-eval
         run: cargo build --release --bin recall-eval
 
+      - name: Graph reachability diagnostic
+        if: ${{ github.event.inputs.reachability == 'true' }}
+        run: |
+          ./target/release/recall-eval \
+            --suite locomo \
+            --graph-reachability locomo-reachability.json \
+            --output locomo-recall.json \
+            --storage ./locomo-storage 2>&1 | tee locomo-reachability.log
+          echo "## LoCoMo graph reachability (pure topology, activation-free)" >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json
+          d = json.load(open('locomo-reachability.json'))
+          def pct(n,dn): return 0.0 if dn==0 else 100.0*n/dn
+          print(f"- max_hops: {d['max_hops']}  (≤2hop% = canonical double-hop signal)")
+          print("\n| category | cases | gold | ≤1hop% | ≤2hop% | ≤3hop% | unreach% | no-seed% |")
+          print("| --- | --- | --- | --- | --- | --- | --- | --- |")
+          rows = sorted(d['by_category'].items()) + [('ALL', d['overall'])]
+          for name,c in rows:
+              g=c['gold_total']
+              print(f"| {name} | {c['cases']} | {g} | {pct(c['reachable_within_1'],g):.1f} | {pct(c['reachable_within_2'],g):.1f} | {pct(c['reachable_within_3'],g):.1f} | {pct(c['unreachable'],g):.1f} | {pct(c['cases_no_seed'],c['cases']):.1f} |")
+          PY
+
       - name: Run LoCoMo recall@k
+        if: ${{ github.event.inputs.reachability != 'true' }}
         env:
           RECALL_DIAG_K: ${{ github.event.inputs.diag_k }}
         run: |
@@ -126,3 +153,5 @@ jobs:
             locomo-recall.json
             locomo-per-case.json
             locomo-recall.log
+            locomo-reachability.json
+            locomo-reachability.log

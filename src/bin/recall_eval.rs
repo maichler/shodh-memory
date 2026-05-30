@@ -19,9 +19,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
 use shodh_memory::memory::types::LayerMode;
-use shodh_memory::recall_harness::report::{compare_to_baseline, Report};
+use shodh_memory::recall_harness::report::{compare_to_baseline, ReachabilityReport, Report};
 use shodh_memory::recall_harness::runner::{
-    run_smoke_suite_with_ranks, ReportWithRanks, RunInputs,
+    analyze_graph_reachability, run_smoke_suite_with_ranks, ReportWithRanks, RunInputs,
 };
 
 /// Exit codes — kept stable so CI scripts can branch on them.
@@ -166,6 +166,16 @@ struct Args {
     #[arg(long, value_enum, default_value_t = LayerArg::Full)]
     layer: LayerArg,
 
+    /// Graph-reachability diagnostic: when set, skip the recall run and instead
+    /// ingest the corpus and walk the built knowledge graph to report, per
+    /// category, how much gold is reachable from the query's seed entities
+    /// within N entity-hops (pure topology, ignoring activation weights). Writes
+    /// a `ReachabilityReport` JSON to this path. Answers whether the graph-native
+    /// fix cluster can lift multi_hop, or whether the gold has no associative
+    /// path at all.
+    #[arg(long)]
+    graph_reachability: Option<PathBuf>,
+
     /// Simulated edge age in days, applied AFTER ingest and BEFORE queries
     /// (decay study). When `> 0`, the harness ages the knowledge-graph edges via
     /// `simulate_edge_aging` at the production ~6h cadence, so recall quality is
@@ -210,6 +220,18 @@ fn run(args: &Args) -> Result<i32> {
         layer_modes: args.layer.to_modes(),
         age_days: args.age_days,
     };
+
+    // Graph-reachability diagnostic short-circuits the recall run entirely.
+    if let Some(reach_path) = &args.graph_reachability {
+        let report = analyze_graph_reachability(&inputs).context("graph-reachability analysis")?;
+        write_reachability(reach_path, &report)?;
+        summarise_reachability(&report);
+        eprintln!(
+            "recall-eval: storage retained at {} (delete manually after inspection)",
+            storage_path.display()
+        );
+        return Ok(EXIT_PASS);
+    }
 
     let ReportWithRanks {
         mut report,
@@ -284,6 +306,56 @@ fn write_report(path: &std::path::Path, report: &Report) -> Result<()> {
     let json = serde_json::to_vec_pretty(report).context("serialising report to JSON")?;
     std::fs::write(path, &json).with_context(|| format!("writing report to {}", path.display()))?;
     Ok(())
+}
+
+fn write_reachability(path: &std::path::Path, report: &ReachabilityReport) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating output dir {}", parent.display()))?;
+        }
+    }
+    let json = serde_json::to_vec_pretty(report).context("serialising reachability report")?;
+    std::fs::write(path, &json)
+        .with_context(|| format!("writing reachability report to {}", path.display()))?;
+    Ok(())
+}
+
+fn summarise_reachability(report: &ReachabilityReport) {
+    let pct = |n: usize, d: usize| if d == 0 { 0.0 } else { 100.0 * n as f64 / d as f64 };
+    eprintln!(
+        "recall-eval: graph reachability (suite={} sha={} max_hops={})",
+        report.suite, report.git_sha, report.max_hops
+    );
+    eprintln!(
+        "  {:<12} {:>6} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10}",
+        "category", "cases", "gold", "≤1hop%", "≤2hop%", "≤3hop%", "unreach%", "no-seed%"
+    );
+    let overall_label = report_overall_label();
+    let mut rows: Vec<(&String, &shodh_memory::recall_harness::report::ReachabilityCategory)> =
+        report.by_category.iter().collect();
+    rows.push((&overall_label, &report.overall));
+    for (name, c) in rows {
+        eprintln!(
+            "  {:<12} {:>6} {:>9} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>9.1}",
+            name,
+            c.cases,
+            c.gold_total,
+            pct(c.reachable_within_1, c.gold_total),
+            pct(c.reachable_within_2, c.gold_total),
+            pct(c.reachable_within_3, c.gold_total),
+            pct(c.unreachable, c.gold_total),
+            pct(c.cases_no_seed, c.cases),
+        );
+    }
+    eprintln!("  ≤2hop% is the canonical double-hop signal: high => graph-native fixes can lift multi_hop;");
+    eprintln!("  low + high unreach% => gold has no associative path (extraction/construction gap or non-entity hop).");
+}
+
+/// Label used for the aggregate reachability row. A function (not a const) so it
+/// owns its `String` and slots into the same `(&String, _)` row vector.
+fn report_overall_label() -> String {
+    "ALL".to_string()
 }
 
 fn summarise(report: &Report) {

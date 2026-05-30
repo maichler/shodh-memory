@@ -317,6 +317,46 @@ pub fn compare_to_baseline(
     failures
 }
 
+/// Graph-reachability diagnostic: for each case, is each gold memory reachable
+/// from the query's seed entities within N entity-hops in the *built* knowledge
+/// graph — ignoring the (separately-audited) spreading-activation weights and
+/// prune threshold. This isolates a pure topology question — "does an
+/// associative path EXIST?" — from "does the current activation math surface
+/// it?". It answers whether the graph-native fix cluster can lift multi_hop:
+/// if the stranded gold is graph-reachable, better activation/ranking will
+/// surface it; if it is not, the deficit is entity-extraction/graph-construction
+/// or a non-entity-mediated hop (a retrieval-reach problem the graph cannot fix).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReachabilityReport {
+    pub suite: String,
+    pub git_sha: String,
+    pub max_hops: usize,
+    pub overall: ReachabilityCategory,
+    pub by_category: BTreeMap<String, ReachabilityCategory>,
+}
+
+/// Reachability tallies for one category (cumulative within-N-hops counts).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ReachabilityCategory {
+    /// Number of cases in this category.
+    pub cases: usize,
+    /// Cases where NER found no query entity that resolves to a graph node —
+    /// the query has no associative anchor at all (an extraction gap, not a
+    /// traversal gap).
+    pub cases_no_seed: usize,
+    /// Total gold memories summed across the category's cases.
+    pub gold_total: usize,
+    /// Gold reachable with the seed entity directly mentioning it (1 hop).
+    pub reachable_within_1: usize,
+    /// Gold reachable within 2 entity-hops (one bridge entity) — the canonical
+    /// double-hop path.
+    pub reachable_within_2: usize,
+    /// Gold reachable within 3 entity-hops.
+    pub reachable_within_3: usize,
+    /// Gold not reachable from any seed entity within `max_hops`.
+    pub unreachable: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
