@@ -385,6 +385,20 @@ fn build_per_case_records(
                 .filter(|id| !topk.contains(id.as_str()))
                 .collect();
             let relevant_total = case.relevant.len();
+            // Recall over wider cutoffs of the same retrieved list. When the
+            // harness queries with a diagnostic `max_results` (RECALL_DIAG_K),
+            // these split "gold ranked >10" from "gold never retrieved".
+            let gold: HashSet<&str> =
+                case.relevant.iter().map(|r| r.corpus_item_id.as_str()).collect();
+            let recall_at = |k: usize| -> f64 {
+                if gold.is_empty() {
+                    return 0.0;
+                }
+                let topn: HashSet<&str> =
+                    ranks[i].retrieved.iter().take(k).map(|s| s.as_str()).collect();
+                let hit = gold.iter().filter(|g| topn.contains(*g)).count();
+                hit as f64 / gold.len() as f64
+            };
             PerCaseRecord {
                 case_id: case.id.clone(),
                 category: category_name(case.category).to_string(),
@@ -396,6 +410,8 @@ fn build_per_case_records(
                 relevant_total,
                 relevant_found: relevant_total - missed.len(),
                 missed,
+                recall_at_50: recall_at(50),
+                recall_at_100: recall_at(100),
             }
         })
         .collect()
@@ -464,6 +480,15 @@ fn run_one_pass(
     let mut per_mode: BTreeMap<LayerMode, ModePassResult> = BTreeMap::new();
     let mut failures: Vec<Failure> = Vec::new();
 
+    // Diagnostic cutoff: when RECALL_DIAG_K is set, fetch a wider list so the
+    // per-case recall@50/@100 fields are meaningful. Headline metrics still cut
+    // at SMOKE_K. Defaults to SMOKE_K (no behavior change). Parse once per pass.
+    let diag_k = std::env::var("RECALL_DIAG_K")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|k| *k >= SMOKE_K)
+        .unwrap_or(SMOKE_K);
+
     for mode in layer_modes {
         let mut per_case = Vec::with_capacity(cases.len());
         let mut latencies_ms = Vec::with_capacity(cases.len());
@@ -473,7 +498,7 @@ fn run_one_pass(
         for case in cases {
             let query = Query {
                 query_text: Some(case.query.clone()),
-                max_results: SMOKE_K,
+                max_results: diag_k,
                 layers: *mode,
                 ..Default::default()
             };
@@ -786,11 +811,17 @@ mod tests {
         assert_eq!(r0.missed, vec!["ssm-002".to_string()]);
         assert_eq!(r0.recall_at_k, 0.5);
         assert_eq!(r0.ndcg_at_k, 0.6);
+        // Wider cutoffs recompute from the full retrieved list vs gold: case 1
+        // found ssm-001 but not ssm-002, so 1/2 at every cutoff.
+        assert_eq!(r0.recall_at_50, 0.5);
+        assert_eq!(r0.recall_at_100, 0.5);
 
         let r1 = &recs[1];
         assert_eq!(r1.category, "entity");
         assert_eq!(r1.relevant_found, 1);
         assert!(r1.missed.is_empty());
+        assert_eq!(r1.recall_at_50, 1.0);
+        assert_eq!(r1.recall_at_100, 1.0);
     }
 
     /// Smoke test the full runner end-to-end against the canonical fixtures.

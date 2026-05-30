@@ -26,6 +26,10 @@ on:
         description: 'Layer attribution: full or all (per-stage)'
         required: false
         default: 'full'
+      diag_k:
+        description: 'Diagnostic cutoff: fetch this many results so per-case recall@50/@100 are meaningful (blank/10 = normal). Use 100 to split ranking vs retrieval-reach.'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -71,6 +75,8 @@ jobs:
         run: cargo build --release --bin recall-eval
 
       - name: Run LoCoMo recall@k
+        env:
+          RECALL_DIAG_K: ${{ github.event.inputs.diag_k }}
         run: |
           ./target/release/recall-eval \
             --suite locomo \
@@ -82,6 +88,7 @@ jobs:
           echo "## LoCoMo held-out recall@k" >> "$GITHUB_STEP_SUMMARY"
           python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import json
+          from collections import defaultdict
           d = json.load(open('locomo-recall.json'))
           full = d['layers'].get('full') or next(iter(d['layers'].values()))
           print(f"- cases: {d['case_count']}  (held-out, gold-evidence)")
@@ -90,6 +97,24 @@ jobs:
           print("| --- | --- | --- |")
           for cat, r in sorted(d['by_category'].items()):
               print(f"| {cat} | {r['recall@10']:.3f} | {r['ndcg@10']:.3f} |")
+          # Ranking-vs-retrieval split from per-case recall@{10,50,100}. The gap
+          # recall@100 - recall@10 is the headroom a perfect top-100 reranker
+          # could recover; a small gap means the gold is not in the pool at all
+          # (a retrieval-reach problem the reranker cannot fix).
+          try:
+              pc = json.load(open('locomo-per-case.json'))['full']
+              agg = defaultdict(lambda: {'n':0,'r10':0.0,'r50':0.0,'r100':0.0})
+              for c in pc:
+                  a = agg[c['category']]; a['n']+=1
+                  a['r10']+=c['recall_at_k']; a['r50']+=c.get('recall_at_50',c['recall_at_k']); a['r100']+=c.get('recall_at_100',c['recall_at_k'])
+              if any(a['r100']>a['r10'] for a in agg.values()):
+                  print("\n### Ranking vs retrieval (recall@k over the SAME wide pool)")
+                  print("| category | recall@10 | recall@50 | recall@100 | rerank headroom |")
+                  print("| --- | --- | --- | --- | --- |")
+                  for cat,a in sorted(agg.items()):
+                      n=a['n']; print(f"| {cat} | {a['r10']/n:.3f} | {a['r50']/n:.3f} | {a['r100']/n:.3f} | {(a['r100']-a['r10'])/n:+.3f} |")
+          except Exception as e:
+              print(f"\n(diagnostic recall@k split unavailable: {e})")
           PY
 
       - name: Upload results

@@ -70,6 +70,17 @@ pub struct PerCaseRecord {
     pub relevant_total: usize,
     pub relevant_found: usize,
     pub missed: Vec<String>,
+    /// Recall computed over a wider cutoff of the SAME retrieved list, to split
+    /// ranking failures (gold present but ranked >10) from retrieval-reach
+    /// failures (gold absent from the candidate funnel). Only informative when
+    /// the harness queries with `max_results >= 50/100` (via `RECALL_DIAG_K`);
+    /// otherwise the list is shorter than the cutoff and these equal
+    /// `recall_at_k`. The gap `recall_at_100 - recall_at_k` is the upper bound
+    /// on what a perfect reranker over the top-100 pool could recover.
+    #[serde(default)]
+    pub recall_at_50: f64,
+    #[serde(default)]
+    pub recall_at_100: f64,
 }
 
 /// Aggregate metrics for one pipeline layer across all cases.
