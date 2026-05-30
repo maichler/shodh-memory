@@ -1246,6 +1246,20 @@ pub const PROSPECTIVE_BOOST_MAX: f32 = 0.75;
 ///   Hebbian scores are already in a small range)
 pub const HEBBIAN_ASSOCIATION_WEIGHT: f32 = 0.1;
 
+/// Maximum fractional lift the Hebbian/graph activation may add to the base
+/// score: `base × (1 + min(hebbian × WEIGHT, HEBBIAN_BOOST_MAX))`.
+///
+/// G2/G5 (algo audit, 2026-05-30): the comment above ASSUMED Hebbian scores are
+/// "in a small range" — measured false. Raw spreading-activation episode scores
+/// reach ~2.0 for HUB episodes (connected to a ubiquitous speaker entity) vs
+/// ~0.07 for distal gold, so the term gave hubs ×1.2 vs gold ×1.007. Once the
+/// Layer-5 fetch break was removed (G1) and the full pool got sorted by final
+/// score, that NON-DISCRIMINATIVE hub activation reordered the top-10 and
+/// collapsed ndcg/mrr. Capping the lift keeps ordering RRF-dominant (a safe
+/// floor) until graph activation is made DISCRIMINATIVE (G5: multi-seed
+/// coverage), after which the cap can be relaxed so association earns rank.
+pub const HEBBIAN_BOOST_MAX: f32 = 0.05;
+
 /// Importance scoring factor — how much importance modulates the retrieval score
 ///
 /// Formula: importance_factor = SCORING_IMPORTANCE_FLOOR + importance × SCORING_IMPORTANCE_RANGE

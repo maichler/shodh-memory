@@ -2999,7 +2999,12 @@ impl MemorySystem {
             // RH-8 gate: Hebbian association boost only applies in `Full` mode.
             let hebbian_boost = hebbian_scores.get(&memory_id).copied().unwrap_or(0.0);
             let base_score = if layer_full {
-                score * (1.0 + hebbian_boost * crate::constants::HEBBIAN_ASSOCIATION_WEIGHT)
+                // G2/G5: cap the graph lift. Raw spreading-activation is
+                // non-discriminative (hubs ~2.0 vs distal gold ~0.07); uncapped
+                // it reorders the post-G1 wide pool by hub-ness, not relevance.
+                let hebbian_lift = (hebbian_boost * crate::constants::HEBBIAN_ASSOCIATION_WEIGHT)
+                    .min(crate::constants::HEBBIAN_BOOST_MAX);
+                score * (1.0 + hebbian_lift)
             } else {
                 score
             };
