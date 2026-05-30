@@ -2244,7 +2244,7 @@ impl MemorySystem {
                     .collect();
                 // Score desc; tie-break by MemoryId asc for deterministic graph candidate order.
                 r.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                r.truncate(200);
+                r.truncate(crate::constants::GRAPH_CANDIDATE_POOL);
                 if !r.is_empty() {
                     tracing::debug!(
                         "Layer 2: {} graph results, {} query entities, top_activation={:.3}",
@@ -2340,7 +2340,11 @@ impl MemorySystem {
         } else {
             1
         };
-        let vector_top_k = query.max_results * 3 * polar_vec_mul;
+        // W4: floor the dense pool to lexical (BM25) parity. `max_results * 3`
+        // (=30) starved fusion of dense-only matches versus BM25's 100.
+        let vector_top_k = (query.max_results * 3)
+            .max(crate::constants::VECTOR_CANDIDATE_POOL_MIN)
+            * polar_vec_mul;
         let vr_pos = self.retriever.search_ids(&vector_query, vector_top_k)?;
         let vr = if let Some(neg_emb) = polar_negated_embedding.as_ref() {
             let mut neg_query = vector_query.clone();
@@ -2937,8 +2941,16 @@ impl MemorySystem {
                 }
             }
 
-            res.truncate(query.max_results);
-            tracing::debug!("Layer 4: {} fused results", res.len());
+            // W2 (keystone): keep a wide rescore window — NOT max_results — so
+            // graph-promoted (rank 11+) and dense-only candidates survive into
+            // Layer-5 unified scoring / competition / quality gate. The single
+            // final deterministic truncate at end-of-recall trims to max_results.
+            let rescore_pool = query
+                .max_results
+                .saturating_mul(crate::constants::RESCORE_POOL_MULT)
+                .max(crate::constants::RESCORE_POOL_MIN);
+            res.truncate(rescore_pool);
+            tracing::debug!("Layer 4: {} fused results (rescore window)", res.len());
 
             // Capture RRF base scores for attribution
             if let Some(ref mut attr_map) = attributions {
@@ -3321,7 +3333,7 @@ impl MemorySystem {
                     * (1.0
                         + if has_entities { 0.1 } else { 0.0 }
                         + if has_context { 0.1 } else { 0.0 });
-                let quality_factor = quality.max(crate::constants::ELABORATION_QUALITY_MIN);
+                let quality_factor = quality.max(crate::constants::RECALL_QUALITY_MIN);
                 if let Some(score) = mem.score {
                     let mut cloned: Memory = mem.as_ref().clone();
                     cloned.set_score(score * quality_factor);

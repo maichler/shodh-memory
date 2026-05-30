@@ -2480,6 +2480,45 @@ pub const PROACTIVE_RECENCY_DECAY_RATE: f32 = 0.03;
 /// their score, while rich elaborated memories get full weight.
 pub const ELABORATION_QUALITY_MIN: f32 = 0.3;
 
+/// Minimum quality-gate factor for the *recall* pipeline (distinct from
+/// `ELABORATION_QUALITY_MIN`, which governs proactive surfacing).
+///
+/// The recall quality gate multiplies a candidate's score by a richness factor
+/// `(content_len / 200).min(1.0) * (1 + entity/context bonuses)`. Conversational
+/// corpora (dialogue turns, chat logs) are legitimately short — a 30-char gold
+/// turn would otherwise be crushed to ×0.15 and demoted out of the rescore
+/// window. Flooring the factor at 0.7 lets length modulate ranking over a
+/// 0.7→1.0 band instead of 0.15→1.0, so short-but-relevant memories survive the
+/// post-fusion rescore (paired with the wide `RESCORE_POOL_*` window below).
+pub const RECALL_QUALITY_MIN: f32 = 0.7;
+
+/// Post-fusion rescore window (keystone): multiplier on `max_results` for the
+/// candidate pool that survives into Layer-5 unified scoring, retrieval
+/// competition, and the quality gate.
+///
+/// Previously the fused pool was truncated to `max_results` (=10) *before* the
+/// cognitive rescore, so every candidate the graph leg and reranker were meant
+/// to rescue (graph-rank 11+, dense-only matches) was discarded before it could
+/// be re-ranked into the final top-k. Widening the window to
+/// `max(max_results * MULT, MIN)` lets those candidates compete; the single
+/// final deterministic truncate still trims to `max_results`.
+pub const RESCORE_POOL_MULT: usize = 10;
+
+/// Floor for the post-fusion rescore window (see `RESCORE_POOL_MULT`).
+pub const RESCORE_POOL_MIN: usize = 50;
+
+/// Spreading-activation candidate pool returned from the graph leg before RRF
+/// fusion. Previously the graph leg truncated to `max_results` (=10), so a
+/// graph-promoted memory at graph-rank 11+ never entered the fusion pool and
+/// the cognitive layer's multi-hop benefit was discarded before rank cutoff.
+pub const GRAPH_CANDIDATE_POOL: usize = 200;
+
+/// Dense (vector) leg candidate-pool floor. The lexical (BM25) leg pools
+/// `candidate_count` (=100) candidates; the dense leg pooled only
+/// `max_results * 3` (=30), starving fusion of dense-only matches that the
+/// lexical leg never surfaces. Floors the dense pool to lexical parity.
+pub const VECTOR_CANDIDATE_POOL_MIN: usize = 100;
+
 /// Tag relevance boost for proactive_context scoring.
 ///
 /// When a memory's structured tags (tool:*, file:*, error) match patterns

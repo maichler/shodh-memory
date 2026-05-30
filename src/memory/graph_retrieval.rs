@@ -971,8 +971,11 @@ pub fn spreading_activation_retrieve_with_stats(
         scored_memories.sort_by(|a, b| b.final_score.total_cmp(&a.final_score));
     }
 
-    // Step 7: Apply limit
-    scored_memories.truncate(query.max_results);
+    // Step 7: Apply limit.
+    // W3: return a wide graph candidate pool (not max_results) so graph-promoted
+    // memories at graph-rank 11+ reach the RRF fusion pool. The downstream
+    // rescore window + final truncate decide the actual top-k.
+    scored_memories.truncate(crate::constants::GRAPH_CANDIDATE_POOL.max(query.max_results));
 
     stats.retrieval_time_us = start_time.elapsed().as_micros() as u64;
 
