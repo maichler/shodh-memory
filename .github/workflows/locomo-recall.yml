@@ -62,6 +62,10 @@ on:
         description: 'L1 substrate test: set true to add YAKE concept keyphrases as graph entities (topic nodes, not just person names). Should grow total_entities + gold≥2seed%.'
         required: false
         default: ''
+      max_cases:
+        description: 'Deterministic case subsample (stride, category-preserving) for fast directional recall reads. Blank/0 = full suite. Corpus is always ingested in full.'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -74,7 +78,7 @@ jobs:
   locomo-recall:
     name: LoCoMo Recall
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300
     steps:
       # Fetch the full history of the dispatched branch, then check out the
       # requested commit by hand. `actions/checkout`'s `ref` input is resolved
@@ -194,6 +198,7 @@ jobs:
           SHODH_CONCEPT_ENTITIES: ${{ github.event.inputs.concepts }}
           SHODH_GRAPH_IDF_EDGES: ${{ github.event.inputs.graph_idf }}
           SHODH_HUB_DEGREE_MAX: ${{ github.event.inputs.hub_max }}
+          SHODH_MAX_CASES: ${{ github.event.inputs.max_cases }}
         run: |
           ./target/release/recall-eval \
             --suite locomo \

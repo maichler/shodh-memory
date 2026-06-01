@@ -182,6 +182,32 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
             .with_context(|| format!("{} suite failed structural validation", inputs.suite))?;
     }
 
+    // Optional deterministic case subsample for fast directional reads
+    // (SHODH_MAX_CASES=N). The CORPUS is always ingested in full so every gold
+    // item still resolves; only the QUERY set is strided down to ~N cases evenly
+    // across the file ordering (which groups by conversation/category), so the
+    // category mix is preserved. Unset / 0 / >= len → no subsampling. This is a
+    // diagnostic-speed knob, never used by the gated CI baseline.
+    let cases = match std::env::var("SHODH_MAX_CASES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0 && n < cases.len())
+    {
+        Some(n) => {
+            let total = cases.len();
+            let stride = (total / n).max(1);
+            let sampled: Vec<_> = cases.into_iter().step_by(stride).take(n).collect();
+            tracing::info!(
+                "SHODH_MAX_CASES={n}: subsampled {} of {} cases (stride {})",
+                sampled.len(),
+                total,
+                stride
+            );
+            sampled
+        }
+        None => cases,
+    };
+
     let repeats = inputs.repeats.max(1);
     // RH-8 (#270): default to `[Full]` when caller passed an empty vec so
     // the existing single-mode contract is preserved by construction.
