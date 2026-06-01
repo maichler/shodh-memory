@@ -191,6 +191,9 @@ jobs:
         env:
           RECALL_DIAG_K: ${{ github.event.inputs.diag_k }}
           SHODH_GRAPH_FUSION_WEIGHT: ${{ github.event.inputs.graph_w }}
+          SHODH_CONCEPT_ENTITIES: ${{ github.event.inputs.concepts }}
+          SHODH_GRAPH_IDF_EDGES: ${{ github.event.inputs.graph_idf }}
+          SHODH_HUB_DEGREE_MAX: ${{ github.event.inputs.hub_max }}
         run: |
           ./target/release/recall-eval \
             --suite locomo \
