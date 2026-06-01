@@ -19,9 +19,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
 use shodh_memory::memory::types::LayerMode;
-use shodh_memory::recall_harness::report::{compare_to_baseline, ReachabilityReport, Report};
+use shodh_memory::recall_harness::report::{
+    compare_to_baseline, LearningCurveReport, ReachabilityReport, Report,
+};
 use shodh_memory::recall_harness::runner::{
-    analyze_graph_reachability, run_smoke_suite_with_ranks, ReportWithRanks, RunInputs,
+    analyze_graph_reachability, analyze_learning_curve, run_smoke_suite_with_ranks, ReportWithRanks,
+    RunInputs,
 };
 
 /// Exit codes — kept stable so CI scripts can branch on them.
@@ -176,6 +179,17 @@ struct Args {
     #[arg(long)]
     graph_reachability: Option<PathBuf>,
 
+    /// Learning-curve diagnostic ("smarter with use"): when set, skip the recall
+    /// run and instead repeatedly recall + reinforce each tracked query, writing
+    /// a `LearningCurveReport` (gold rank/score per reinforcement cycle) to this
+    /// path. Measures whether memories become easier to recall as they are used.
+    #[arg(long)]
+    learning_curve: Option<PathBuf>,
+
+    /// Reinforcement cycles for the learning-curve diagnostic.
+    #[arg(long, default_value_t = 8)]
+    lc_cycles: usize,
+
     /// Simulated edge age in days, applied AFTER ingest and BEFORE queries
     /// (decay study). When `> 0`, the harness ages the knowledge-graph edges via
     /// `simulate_edge_aging` at the production ~6h cadence, so recall quality is
@@ -226,6 +240,19 @@ fn run(args: &Args) -> Result<i32> {
         let report = analyze_graph_reachability(&inputs).context("graph-reachability analysis")?;
         write_reachability(reach_path, &report)?;
         summarise_reachability(&report);
+        eprintln!(
+            "recall-eval: storage retained at {} (delete manually after inspection)",
+            storage_path.display()
+        );
+        return Ok(EXIT_PASS);
+    }
+
+    // Learning-curve diagnostic short-circuits the recall run entirely.
+    if let Some(lc_path) = &args.learning_curve {
+        let report =
+            analyze_learning_curve(&inputs, args.lc_cycles).context("learning-curve analysis")?;
+        write_learning_curve(lc_path, &report)?;
+        summarise_learning_curve(&report);
         eprintln!(
             "recall-eval: storage retained at {} (delete manually after inspection)",
             storage_path.display()
@@ -356,6 +383,42 @@ fn summarise_reachability(report: &ReachabilityReport) {
 /// owns its `String` and slots into the same `(&String, _)` row vector.
 fn report_overall_label() -> String {
     "ALL".to_string()
+}
+
+fn write_learning_curve(path: &std::path::Path, report: &LearningCurveReport) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating output dir {}", parent.display()))?;
+        }
+    }
+    let json = serde_json::to_vec_pretty(report).context("serialising learning-curve report")?;
+    std::fs::write(path, &json)
+        .with_context(|| format!("writing learning-curve report to {}", path.display()))?;
+    Ok(())
+}
+
+fn summarise_learning_curve(report: &LearningCurveReport) {
+    eprintln!(
+        "recall-eval: learning curve (suite={} sha={} cycles={} tracked_cases={})",
+        report.suite, report.git_sha, report.cycles, report.tracked_cases
+    );
+    eprintln!("  cycle:  mean_gold_rank   mean_gold_score   (rank DOWN + score UP = learning)");
+    for c in 0..report.mean_rank_by_cycle.len() {
+        let tag = if c == 0 { "cold" } else { "" };
+        eprintln!(
+            "   {:>2} {:<5} {:>14.3} {:>17.4}",
+            c, tag, report.mean_rank_by_cycle[c], report.mean_score_by_cycle[c]
+        );
+    }
+    eprintln!(
+        "  improved={} worsened={} unchanged={}  mean_rank_delta={:+.3} (neg=better) mean_score_delta={:+.4}",
+        report.improved,
+        report.worsened,
+        report.unchanged,
+        report.mean_rank_delta,
+        report.mean_score_delta
+    );
 }
 
 fn summarise(report: &Report) {

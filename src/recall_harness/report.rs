@@ -366,6 +366,35 @@ pub struct ReachabilityCategory {
     pub cases_multi_seed: usize,
 }
 
+/// Learning-curve diagnostic: does recall of a memory IMPROVE as the memory is
+/// used? The flagship test of the "smarter with use" claim that no single-shot
+/// retrieval metric can see. Protocol: for cases whose gold sits at a
+/// recallable-but-not-top rank (headroom), repeatedly recall the query while
+/// applying `Helpful` feedback to the gold; track the gold's rank and score per
+/// cycle. A genuine associative/Hebbian memory shows the rank DECREASE (gold
+/// climbs) and score RISE over cycles; a static retriever stays flat.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LearningCurveReport {
+    pub suite: String,
+    pub git_sha: String,
+    pub cycles: usize,
+    /// Cases whose cold gold-rank fell in the headroom band (≥2, ≤cap).
+    pub tracked_cases: usize,
+    /// Mean gold rank at each cycle: index 0 = cold, 1..=cycles after each
+    /// reinforcement. DECREASING = learning.
+    pub mean_rank_by_cycle: Vec<f64>,
+    /// Mean gold score at each cycle. RISING = the reinforced memory is boosted
+    /// even when its integer rank hasn't moved yet.
+    pub mean_score_by_cycle: Vec<f64>,
+    /// Cases where final rank < initial rank (the memory got easier to recall).
+    pub improved: usize,
+    pub worsened: usize,
+    pub unchanged: usize,
+    /// Mean (final_rank − initial_rank); NEGATIVE = "smarter with use", quantified.
+    pub mean_rank_delta: f64,
+    pub mean_score_delta: f64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

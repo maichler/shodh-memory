@@ -42,6 +42,10 @@ on:
         description: 'Embedding model: blank/minilm = MiniLM-L6 (default), e5 = e5-small-v2 (384-dim, retrieval-tuned, asymmetric query/passage). Edge-legal drop-in.'
         required: false
         default: ''
+      learning_curve:
+        description: 'Learning-curve diagnostic ("smarter with use"): set true to skip recall and instead measure whether gold rank/score improves as memories are reinforced over cycles (runs on the fast smoke corpus).'
+        required: false
+        default: 'false'
 
 permissions:
   contents: read
@@ -125,8 +129,32 @@ jobs:
           print("\ngold≥2seed% = the G5 multi-seed discrimination signal. If ~0, queries resolve to too few graph cues; the lever is richer query→graph cue extraction, not episode scoring.")
           PY
 
+      - name: Learning-curve diagnostic (smarter-with-use)
+        if: ${{ github.event.inputs.learning_curve == 'true' }}
+        run: |
+          ./target/release/recall-eval \
+            --suite smoke \
+            --learning-curve learning-curve.json \
+            --lc-cycles 8 \
+            --output unused-recall.json \
+            --storage ./lc-storage 2>&1 | tee learning-curve.log
+          echo "## Learning curve — does recall improve with use?" >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json
+          d = json.load(open('learning-curve.json'))
+          print(f"- tracked cases (cold gold-rank in headroom): {d['tracked_cases']}, cycles: {d['cycles']}")
+          print(f"- **mean rank: {d['mean_rank_by_cycle'][0]:.2f} (cold) -> {d['mean_rank_by_cycle'][-1]:.2f} (final)**  delta {d['mean_rank_delta']:+.3f} (negative = climbs with use)")
+          print(f"- mean score: {d['mean_score_by_cycle'][0]:.4f} -> {d['mean_score_by_cycle'][-1]:.4f}  delta {d['mean_score_delta']:+.4f}")
+          print(f"- improved: {d['improved']}  worsened: {d['worsened']}  unchanged: {d['unchanged']}")
+          print("\n| cycle | mean gold rank | mean gold score |")
+          print("| --- | --- | --- |")
+          for i,(r,s) in enumerate(zip(d['mean_rank_by_cycle'], d['mean_score_by_cycle'])):
+              print(f"| {i}{' (cold)' if i==0 else ''} | {r:.3f} | {s:.4f} |")
+          print("\nrank DOWN + score UP across cycles = the 'smarter with use' claim, measured.")
+          PY
+
       - name: Run LoCoMo recall@k
-        if: ${{ github.event.inputs.reachability != 'true' }}
+        if: ${{ github.event.inputs.reachability != 'true' && github.event.inputs.learning_curve != 'true' }}
         env:
           RECALL_DIAG_K: ${{ github.event.inputs.diag_k }}
           SHODH_GRAPH_FUSION_WEIGHT: ${{ github.event.inputs.graph_w }}
@@ -181,3 +209,5 @@ jobs:
             locomo-recall.log
             locomo-reachability.json
             locomo-reachability.log
+            learning-curve.json
+            learning-curve.log
