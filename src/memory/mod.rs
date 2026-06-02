@@ -2587,15 +2587,34 @@ impl MemorySystem {
             let graph_topn: Vec<MemoryId> =
                 graph_results.iter().map(|(id, _, _)| id.clone()).collect();
 
-            // E3 fusion-fix B — activation-proportional additive term
+            // E3 fusion-fix B (gated) — activation-proportional additive term
             // (SHODH_GRAPH_ACT_ADD=<scale>). The graph RRF (~w/(k+rank)) is tiny
             // and gets diluted by BM25's many weak lexical matches; this adds a
             // non-dilutable term proportional to spreading activation so a
             // confident graph hit competes on the fused scale. Default unset → 0.
+            //
+            // CRITICAL gate: apply the boost ONLY to graph candidates that BM25/
+            // vector did NOT already rank in their top window (`hybrid_top`). A
+            // global boost is catastrophic on lexical corpora (LoCoMo recall@10
+            // −0.187 at scale 0.5) because it floods the top-k with graph-
+            // activated memories that are WRONG when BM25 is right. Restricting
+            // it to graph-EXCLUSIVE finds (the answer BM25 buried) repairs the
+            // multi-hop dilution without disturbing the BM25 backbone: if BM25
+            // already ranks a memory highly, trust it; only lift what the graph
+            // found and lexical retrieval missed.
             let graph_act_add: f32 = std::env::var("SHODH_GRAPH_ACT_ADD")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0.0);
+            let hybrid_top: std::collections::HashSet<MemoryId> = if graph_act_add > 0.0 {
+                hybrid_ids
+                    .iter()
+                    .take(query.max_results.max(1))
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            };
 
             // Graph results: pure RRF with density weight
             for (r, (id, activation, h)) in graph_results.iter().enumerate() {
@@ -2612,7 +2631,9 @@ impl MemorySystem {
                         * activation.clamp(0.0, 1.0);
                 if let Some(score) = fused.get_mut(id) {
                     *score *= activation_factor;
-                    if graph_act_add > 0.0 {
+                    // Gated additive: only lift graph-exclusive finds (absent from
+                    // BM25/vector's top window), never memories BM25 already ranks.
+                    if graph_act_add > 0.0 && !hybrid_top.contains(id) {
                         *score += graph_w * graph_act_add * activation.clamp(0.0, 1.0);
                     }
                 }
