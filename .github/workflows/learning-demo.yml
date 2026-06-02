@@ -1,0 +1,95 @@
+# Learning demo — make "gets smarter with use" palpable.
+#
+# Runs the 3-arm learning-curve harness (Helpful / Neutral / Misleading) over N
+# reinforcement cycles and reports, per arm, how the gold's rank and score move
+# as feedback MOMENTUM accumulates. The momentum cap (SHODH_FEEDBACK_MOMENTUM_SCALE)
+# is the lever: at the 0.15 default, built-up momentum is throttled and learning
+# is imperceptible; raise it so accumulated momentum becomes load-bearing.
+# Momentum is an EMA (gradual, robust to a single bad signal) — this measures
+# learning, not forcing.
+name: Learning demo (momentum)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'git ref/commit to benchmark (blank = this branch head)'
+        required: false
+        default: ''
+      momentum_scale:
+        description: 'SHODH_FEEDBACK_MOMENTUM_SCALE — cap on built-up momentum''s score influence (default 0.15). Raise (e.g. 0.5/1.0) to make accumulated learning load-bearing.'
+        required: false
+        default: ''
+      reward_lr_mult:
+        description: 'SHODH_REWARD_LR_MULT — per-event reinforcement multiplier (default 1.0).'
+        required: false
+        default: ''
+      cycles:
+        description: 'Reinforcement cycles per arm (default 8). More cycles = more accumulated momentum.'
+        required: false
+        default: '8'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: learning-demo-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  learning-demo:
+    name: Learning demo
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check out requested commit
+        if: ${{ github.event.inputs.ref != '' }}
+        run: |
+          git checkout "${{ github.event.inputs.ref }}"
+          echo "Checked out $(git rev-parse --short HEAD)"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: recall-eval
+
+      - name: Install LLVM (ONNX runtime build dep)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang
+
+      - name: Build recall-eval
+        run: cargo build --release --bin recall-eval
+
+      - name: Learning curve (momentum)
+        env:
+          SHODH_FEEDBACK_MOMENTUM_SCALE: ${{ github.event.inputs.momentum_scale }}
+          SHODH_REWARD_LR_MULT: ${{ github.event.inputs.reward_lr_mult }}
+        run: |
+          CYC="${{ github.event.inputs.cycles }}"; CYC="${CYC:-8}"
+          ./target/release/recall-eval \
+            --suite smoke \
+            --learning-curve learning-curve.json \
+            --lc-cycles "$CYC" \
+            --output unused-recall.json \
+            --storage ./lc-storage 2>&1 | tee learning-curve.log
+          echo "## Learning demo — momentum (scale=\`${SHODH_FEEDBACK_MOMENTUM_SCALE:-0.15 default}\`, reward_mult=\`${SHODH_REWARD_LR_MULT:-1.0}\`, cycles=$CYC)" >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json
+          d = json.load(open('learning-curve.json'))
+          print(f"\nPalpable learning = Helpful rank goes DOWN (toward 1) as momentum accumulates, Misleading goes UP, Neutral ~flat — and gradually, robustly.\n")
+          print("| outcome | tracked | rank cold→final (Δ) | score cold→final (Δ) | improved/worsened/unchanged |")
+          print("| --- | --- | --- | --- | --- |")
+          for a in d['arms']:
+              r=a['mean_rank_by_cycle']; s=a['mean_score_by_cycle']
+              print(f"| **{a['outcome']}** | {a['tracked_cases']} | {r[0]:.2f}→{r[-1]:.2f} ({a['mean_rank_delta']:+.3f}) | {s[0]:.4f}→{s[-1]:.4f} ({a['mean_score_delta']:+.4f}) | {a['improved']}/{a['worsened']}/{a['unchanged']} |")
+          # Full rank-by-cycle trajectory for the Helpful arm — the "watch it learn" curve.
+          h=next((a for a in d['arms'] if a['outcome']=='Helpful'),None)
+          if h:
+              traj=" → ".join(f"{x:.2f}" for x in h['mean_rank_by_cycle'])
+              print(f"\nHelpful mean-gold-rank per cycle (cold→…→final): {traj}")
+          PY
