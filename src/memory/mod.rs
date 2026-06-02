@@ -6330,6 +6330,48 @@ impl MemorySystem {
             }
         }
 
+        // Connect feedback to MOMENTUM — the load-bearing learning signal.
+        // Previously reinforce_recall only bumped importance + graph edges; it
+        // never touched the feedback-momentum EMA, so the momentum store and the
+        // reinforcement path were disconnected. That is why raising
+        // FEEDBACK_MOMENTUM_SCALE did nothing on the learning curve (the harness
+        // drives reinforce_recall, not the momentum store). Push a +1 (Helpful) /
+        // −1 (Misleading) signal per reinforced memory into the EMA. The EMA
+        // accumulates it gradually (inertia-damped, robust to a single bad
+        // signal), so repeated use BUILDS momentum that becomes load-bearing in
+        // recall (Layer 5 feedback_multiplier) — momentum, not forcing.
+        if let Some(fs) = &self.feedback_store {
+            let value: f32 = match outcome {
+                RetrievalOutcome::Helpful => 1.0,
+                RetrievalOutcome::Misleading => -1.0,
+                RetrievalOutcome::Neutral => 0.0,
+            };
+            if value != 0.0 {
+                let now = chrono::Utc::now();
+                let mut guard = fs.write();
+                for id in memory_ids {
+                    let mtype = self
+                        .long_term_memory
+                        .get(id)
+                        .map(|m| m.experience.experience_type)
+                        .unwrap_or(ExperienceType::Observation);
+                    {
+                        let momentum = guard.get_or_create_momentum(id.clone(), mtype);
+                        momentum.update(SignalRecord {
+                            timestamp: now,
+                            value,
+                            confidence: 1.0,
+                            trigger: SignalTrigger::TemporalCredit {
+                                turns_aggregated: 1,
+                                raw_total: value,
+                            },
+                        });
+                    }
+                    guard.mark_dirty(id);
+                }
+            }
+        }
+
         // Report aggregate persistence failures
         if !persist_failures.is_empty() {
             stats.persist_failures = persist_failures.len();
