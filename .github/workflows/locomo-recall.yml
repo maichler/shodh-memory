@@ -74,6 +74,18 @@ on:
         description: 'Number of planted chains for the multi-hop diagnostic (default 60).'
         required: false
         default: ''
+      graph_reserve_k:
+        description: 'E3 fusion-fix A: reserve a final top-k slot for the top-N graph-leg candidates (anti-dilution). Blank = off.'
+        required: false
+        default: ''
+      graph_act_add:
+        description: 'E3 fusion-fix B: activation-proportional additive graph term (scale, e.g. 0.1). Blank = off.'
+        required: false
+        default: ''
+      graph_w_floor:
+        description: 'E3 fusion-fix C: floor the graph fusion weight (e.g. 0.7) and renormalise hybrid down. Blank = off.'
+        required: false
+        default: ''
       concept_seed_df_max:
         description: 'IDF gate on concept seeds: skip concept (YAKE) query seeds whose corpus mention_count exceeds this (generic hubs). Blank = no gate. Use with concepts=true to test discriminating-only cues.'
         required: false
@@ -208,6 +220,9 @@ jobs:
         env:
           SHODH_GRAPH_IDF_EDGES: ${{ github.event.inputs.graph_idf }}
           SHODH_HUB_DEGREE_MAX: ${{ github.event.inputs.hub_max }}
+          SHODH_GRAPH_RESERVE_K: ${{ github.event.inputs.graph_reserve_k }}
+          SHODH_GRAPH_ACT_ADD: ${{ github.event.inputs.graph_act_add }}
+          SHODH_GRAPH_W_FLOOR: ${{ github.event.inputs.graph_w_floor }}
         run: |
           CHAINS_ARG=""
           if [ -n "${{ github.event.inputs.mh_chains }}" ]; then CHAINS_ARG="--mh-chains ${{ github.event.inputs.mh_chains }}"; fi

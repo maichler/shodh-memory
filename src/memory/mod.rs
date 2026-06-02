@@ -2530,7 +2530,7 @@ impl MemorySystem {
             // Density-based weights (already tuned in calculate_density_weights)
             // Sparse (≤0.5): graph_w=0.5, semantic_w=0.4, linguistic_w=0.1
             // Dense (≥2.0):  graph_w=0.1, semantic_w=0.7, linguistic_w=0.2
-            let (semantic_w, mut graph_w, linguistic_w) = graph_density
+            let (mut semantic_w, mut graph_w, linguistic_w) = graph_density
                 .map(calculate_density_weights)
                 .unwrap_or((0.6, 0.3, 0.1));
 
@@ -2543,6 +2543,22 @@ impl MemorySystem {
             if let Ok(v) = std::env::var("SHODH_GRAPH_FUSION_WEIGHT") {
                 if let Ok(w) = v.parse::<f32>() {
                     graph_w = w.clamp(0.0, 1.0);
+                }
+            }
+
+            // E3 fusion-fix C — graph-weight floor (SHODH_GRAPH_W_FLOOR).
+            // The density logic caps graph_w at 0.5 even for the sparsest graph,
+            // which on multi-hop queries leaves the graph's correct (but
+            // deep-ranked) answer too weak to survive BM25's lexical crowd. This
+            // raises graph_w to a floor and renormalises hybrid down, to test
+            // whether simply trusting the graph more recovers multi-hop. Default
+            // unset → unchanged.
+            if let Ok(v) = std::env::var("SHODH_GRAPH_W_FLOOR") {
+                if let Ok(f) = v.parse::<f32>() {
+                    if f > graph_w {
+                        graph_w = f.clamp(0.0, 0.95);
+                        semantic_w = (1.0 - graph_w - linguistic_w).max(0.0);
+                    }
                 }
             }
 
@@ -2564,6 +2580,23 @@ impl MemorySystem {
                 s.linguistic_weight = linguistic_w;
             }
 
+            // E3 fusion-fix A — reserved graph quota. Capture the graph leg's
+            // ranked ids so the top-N can be guaranteed a slot in the final
+            // top-k regardless of RRF dilution by BM25's lexical crowd (see the
+            // SHODH_GRAPH_RESERVE_K injection before truncation below).
+            let graph_topn: Vec<MemoryId> =
+                graph_results.iter().map(|(id, _, _)| id.clone()).collect();
+
+            // E3 fusion-fix B — activation-proportional additive term
+            // (SHODH_GRAPH_ACT_ADD=<scale>). The graph RRF (~w/(k+rank)) is tiny
+            // and gets diluted by BM25's many weak lexical matches; this adds a
+            // non-dilutable term proportional to spreading activation so a
+            // confident graph hit competes on the fused scale. Default unset → 0.
+            let graph_act_add: f32 = std::env::var("SHODH_GRAPH_ACT_ADD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+
             // Graph results: pure RRF with density weight
             for (r, (id, activation, h)) in graph_results.iter().enumerate() {
                 // Standard RRF: weight / (k + rank), rank is 1-indexed
@@ -2579,6 +2612,9 @@ impl MemorySystem {
                         * activation.clamp(0.0, 1.0);
                 if let Some(score) = fused.get_mut(id) {
                     *score *= activation_factor;
+                    if graph_act_add > 0.0 {
+                        *score += graph_w * graph_act_add * activation.clamp(0.0, 1.0);
+                    }
                 }
 
                 // Track per-memory graph RRF contribution
@@ -2968,6 +3004,38 @@ impl MemorySystem {
                     // Re-sort after boosting since ranks may have changed.
                     // Tie-break by MemoryId — same rationale as the pre-rerank sort above.
                     res.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                }
+            }
+
+            // E3 fusion-fix A — reserved graph quota (SHODH_GRAPH_RESERVE_K=N).
+            // `res` is sorted by fused score; truncation to max_results drops the
+            // graph's correct-but-deep-ranked multi-hop answer once BM25's lexical
+            // crowd dilutes it. Guarantee the top-N graph-leg candidates a slot
+            // within the kept window: any reserved id ranked beyond max_results is
+            // promoted to the tail of the window (displacing the lowest-scored
+            // non-reserved kept item). Default unset → no change.
+            if let Some(reserve_k) = std::env::var("SHODH_GRAPH_RESERVE_K")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+            {
+                let mr = query.max_results.max(1);
+                if res.len() > mr {
+                    let reserved: Vec<MemoryId> =
+                        graph_topn.iter().take(reserve_k).cloned().collect();
+                    for mid in reserved {
+                        // Already inside the kept window? nothing to do.
+                        if res.iter().take(mr).any(|(id, _)| id == &mid) {
+                            continue;
+                        }
+                        // Present further down? promote it to the window tail.
+                        if let Some(cur) = res.iter().position(|(id, _)| id == &mid) {
+                            if cur >= mr {
+                                let item = res.remove(cur);
+                                res.insert(mr - 1, item);
+                            }
+                        }
+                    }
                 }
             }
 
