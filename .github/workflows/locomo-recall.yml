@@ -30,20 +30,16 @@ on:
         description: 'Diagnostic cutoff: fetch this many results so per-case recall@50/@100 are meaningful (blank/10 = normal). Use 100 to split ranking vs retrieval-reach.'
         required: false
         default: ''
-      reachability:
-        description: 'Graph-reachability diagnostic: set true to skip the recall run and instead report, per category, how much gold is reachable from query seed entities within N entity-hops (pure topology).'
+      mode:
+        description: 'What to run: recall (default) | reachability | learning_curve | multi_hop | ablation'
         required: false
-        default: 'false'
-      learning_curve:
-        description: 'Learning-curve diagnostic ("smarter with use"): set true to skip recall and instead measure the reward gradient (Helpful/Neutral/Misleading) over reinforcement cycles on the smoke corpus.'
+        default: 'recall'
+      suite:
+        description: 'Suite for recall/ablation: locomo (default) or smoke'
         required: false
-        default: 'false'
-      multi_hop:
-        description: 'E3 controlled multi-hop diagnostic: set true to run synthetic planted 2-hop chains (gold reachable ONLY via graph traversal) through every layer and report per-layer 2-hop vs 1-hop recall. Skips the recall suite.'
-        required: false
-        default: 'false'
+        default: 'locomo'
       extra_env:
-        description: 'Extra SHODH_* flags as space-separated KEY=VAL (e.g. "SHODH_GRAPH_EXPAND_K=5 SHODH_FEEDBACK_MOMENTUM_SCALE=0.6"). Exported into every recall step.'
+        description: 'Extra SHODH_* flags, space-separated KEY=VAL (e.g. "SHODH_GRAPH_EXPAND_K=5 SHODH_FEEDBACK_MOMENTUM_SCALE=0.6 SHODH_MAX_CASES=600"). Exported into the run.'
         required: false
         default: ''
 
@@ -107,13 +103,14 @@ jobs:
         run: cargo build --release --bin recall-eval
 
       - name: Graph reachability diagnostic
-        if: ${{ github.event.inputs.reachability == 'true' }}
+        if: ${{ github.event.inputs.mode == 'reachability' }}
         env:
           SHODH_GRAPH_IDF_EDGES: ${{ github.event.inputs.graph_idf }}
           SHODH_HUB_DEGREE_MAX: ${{ github.event.inputs.hub_max }}
           SHODH_CONCEPT_ENTITIES: ${{ github.event.inputs.concepts }}
           SHODH_CONCEPT_SEED_DF_MAX: ${{ github.event.inputs.concept_seed_df_max }}
         run: |
+          for kv in ${{ github.event.inputs.extra_env }}; do export "$kv"; done
           ./target/release/recall-eval \
             --suite locomo \
             --graph-reachability locomo-reachability.json \
@@ -141,12 +138,13 @@ jobs:
           PY
 
       - name: Learning-curve diagnostic (reward gradient)
-        if: ${{ github.event.inputs.learning_curve == 'true' }}
+        if: ${{ github.event.inputs.mode == 'learning_curve' }}
         env:
           SHODH_REWARD_LR_MULT: ${{ github.event.inputs.reward_lr_mult }}
           SHODH_GRAPH_IDF_EDGES: ${{ github.event.inputs.graph_idf }}
           SHODH_HUB_DEGREE_MAX: ${{ github.event.inputs.hub_max }}
         run: |
+          for kv in ${{ github.event.inputs.extra_env }}; do export "$kv"; done
           ./target/release/recall-eval \
             --suite smoke \
             --learning-curve learning-curve.json \
@@ -172,14 +170,15 @@ jobs:
           PY
 
       - name: Ablation matrix (see+update studies)
-        if: ${{ github.event.inputs.ablation == 'true' }}
+        if: ${{ github.event.inputs.mode == 'ablation' }}
         run: |
-          ./target/release/recall-eval             --suite "${{ github.event.inputs.ablation_suite }}"             --ablation ablation.json             --output unused-recall.json             --storage ./abl-storage 2>&1 | tee ablation.log
+          for kv in ${{ github.event.inputs.extra_env }}; do export "$kv"; done
+          ./target/release/recall-eval             --suite "${{ github.event.inputs.suite }}"             --ablation ablation.json             --output unused-recall.json             --storage ./abl-storage 2>&1 | tee ablation.log
           echo "## Ablation matrix" >> "$GITHUB_STEP_SUMMARY"
           sed -n '/## Ablation matrix/,$p' ablation.log >> "$GITHUB_STEP_SUMMARY" || true
 
       - name: Multi-hop diagnostic (E3 — planted 2-hop chains)
-        if: ${{ github.event.inputs.multi_hop == 'true' }}
+        if: ${{ github.event.inputs.mode == 'multi_hop' }}
         env:
           SHODH_GRAPH_IDF_EDGES: ${{ github.event.inputs.graph_idf }}
           SHODH_HUB_DEGREE_MAX: ${{ github.event.inputs.hub_max }}
@@ -216,7 +215,7 @@ jobs:
           PY
 
       - name: Run LoCoMo recall@k
-        if: ${{ github.event.inputs.reachability != 'true' && github.event.inputs.learning_curve != 'true' && github.event.inputs.multi_hop != 'true' && github.event.inputs.ablation != 'true' }}
+        if: ${{ github.event.inputs.mode == 'recall' || github.event.inputs.mode == '' }}
         env:
           RECALL_DIAG_K: ${{ github.event.inputs.diag_k }}
           SHODH_GRAPH_FUSION_WEIGHT: ${{ github.event.inputs.graph_w }}
@@ -234,6 +233,7 @@ jobs:
           SHODH_GRAPH_EXPAND_K: ${{ github.event.inputs.graph_expand_k }}
           SHODH_GRAPH_EXPAND_MIN_STRENGTH: ${{ github.event.inputs.graph_expand_min_strength }}
         run: |
+          for kv in ${{ github.event.inputs.extra_env }}; do export "$kv"; done
           ./target/release/recall-eval \
             --suite locomo \
             --layer "${{ github.event.inputs.layer }}" \
