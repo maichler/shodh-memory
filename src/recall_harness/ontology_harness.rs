@@ -171,11 +171,14 @@ pub fn analyze_ontology(inputs: &RunInputs, items: usize) -> Result<MultiHopRepo
     };
     let out = run_smoke_suite_with_ranks(&run_inputs).context("ontology suite run failed")?;
 
-    let mean = |records: &[crate::recall_harness::report::PerCaseRecord], cat: &str| -> f64 {
+    let mean = |records: &[crate::recall_harness::report::PerCaseRecord],
+                cat: &str,
+                sel: fn(&crate::recall_harness::report::PerCaseRecord) -> f64|
+     -> f64 {
         let vals: Vec<f64> = records
             .iter()
             .filter(|r| r.category == cat)
-            .map(|r| r.recall_at_k)
+            .map(sel)
             .collect();
         if vals.is_empty() {
             0.0
@@ -189,9 +192,11 @@ pub fn analyze_ontology(inputs: &RunInputs, items: usize) -> Result<MultiHopRepo
         if let Some(records) = out.per_case_by_layer.get(&key) {
             rows.push(MultiHopLayerRow {
                 layer: key,
-                multihop_recall_at_10: mean(records, "entity"),
-                onehop_recall_at_10: mean(records, "code"),
-                multihop_mrr: 0.0,
+                multihop_recall_at_10: mean(records, "entity", |r| r.recall_at_k),
+                onehop_recall_at_10: mean(records, "code", |r| r.recall_at_k),
+                multihop_mrr: mean(records, "entity", |r| r.mrr),
+                multihop_p_at_1: mean(records, "entity", |r| r.p_at_1),
+                onehop_p_at_1: mean(records, "code", |r| r.p_at_1),
             });
         }
     }

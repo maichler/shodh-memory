@@ -321,21 +321,21 @@ fn run(args: &Args) -> Result<i32> {
             report.chains, report.multihop_cases, report.onehop_cases
         );
         println!("## Temporal controlled (planted time-varying facts)\n");
-        println!("| stage | valid-at-T recall@10 | Δ vs prev | latest-control recall@10 |");
-        println!("| --- | --- | --- | --- |");
+        println!("| stage | valid-at-T P@1 | Δ vs prev | control P@1 | validT recall@10 |");
+        println!("| --- | --- | --- | --- | --- |");
         let mut prev: Option<f64> = None;
         for r in &report.rows {
             let d = match prev {
-                Some(p) => format!("{:+.4}", r.multihop_recall_at_10 - p),
+                Some(p) => format!("{:+.4}", r.multihop_p_at_1 - p),
                 None => String::new(),
             };
             println!(
-                "| {} | {:.4} | {} | {:.4} |",
-                r.layer, r.multihop_recall_at_10, d, r.onehop_recall_at_10
+                "| {} | {:.4} | {} | {:.4} | {:.4} |",
+                r.layer, r.multihop_p_at_1, d, r.onehop_p_at_1, r.multihop_recall_at_10
             );
-            prev = Some(r.multihop_recall_at_10);
+            prev = Some(r.multihop_p_at_1);
         }
-        println!("\nvalid-at-T = retrieve the fact true at the queried time (gold = EARLIER memory). The +facts/+rerank delta here is the temporal layer's isolated contribution; latest-control should be BM25-solvable.");
+        println!("\nP@1 is the metric: gold = the state in force at the queried year, which must rank #1 above the 2 equi-lexical distractor states (recall@10 saturates at 1.0 — only 3 candidates fit the window). The +facts/+rerank delta on valid-at-T P@1 is the temporal layer's isolated contribution; baseline ≈ 1/3 chance.");
         eprintln!(
             "recall-eval: storage retained at {} (delete manually after inspection)",
             storage_path.display()
@@ -353,9 +353,9 @@ fn run(args: &Args) -> Result<i32> {
         print_cap_ladder(
             &report,
             "Ontology (type-disambiguation)",
-            "type-qualified recall@10",
-            "lexical-control recall@10",
-            "+rerank delta on type-qualified = the ontology layer's isolated contribution; ~0 ⇒ ontology rerank inert.",
+            "type-qualified",
+            "lexical-control",
+            "+rerank delta on type-qualified P@1 = the ontology layer's isolated contribution (baseline ≈ 1/(1+K orgs)); ~0 ⇒ ontology rerank inert.",
         );
         return Ok(EXIT_PASS);
     }
@@ -370,9 +370,9 @@ fn run(args: &Args) -> Result<i32> {
         print_cap_ladder(
             &report,
             "Causal lineage (root-cause chains)",
-            "root-cause recall@10",
-            "direct-cause control recall@10",
-            "root-cause is reachable only by chaining; if it stays ~0 across layers, causal/lineage retrieval is not exercised in eval.",
+            "root-cause",
+            "direct-cause control",
+            "root-cause is reachable only by chaining past the lexical direct-cause distractor; if it stays ~0 across layers, causal/lineage retrieval is not exercised in eval.",
         );
         return Ok(EXIT_PASS);
     }
@@ -705,21 +705,21 @@ fn print_cap_ladder(
         report.multihop_cases, report.onehop_cases
     );
     println!("## {title}\n");
-    println!("| stage | {cap_col} | Δ vs prev | {ctrl_col} |");
-    println!("| --- | --- | --- | --- |");
+    println!("| stage | {cap_col} P@1 | Δ vs prev | {ctrl_col} P@1 | {cap_col} recall@10 |");
+    println!("| --- | --- | --- | --- | --- |");
     let mut prev: Option<f64> = None;
     for r in &report.rows {
         let d = match prev {
-            Some(p) => format!("{:+.4}", r.multihop_recall_at_10 - p),
+            Some(p) => format!("{:+.4}", r.multihop_p_at_1 - p),
             None => String::new(),
         };
         println!(
-            "| {} | {:.4} | {} | {:.4} |",
-            r.layer, r.multihop_recall_at_10, d, r.onehop_recall_at_10
+            "| {} | {:.4} | {} | {:.4} | {:.4} |",
+            r.layer, r.multihop_p_at_1, d, r.onehop_p_at_1, r.multihop_recall_at_10
         );
-        prev = Some(r.multihop_recall_at_10);
+        prev = Some(r.multihop_p_at_1);
     }
-    println!("\n{note}");
+    println!("\nP@1 is the metric: the capability-correct item must rank #1 above its equi-confusable distractors (recall@10 saturates because the whole confusable set fits the top-10 window). {note}");
 }
 
 fn write_decay(path: &std::path::Path, report: &DecayReport) -> Result<()> {

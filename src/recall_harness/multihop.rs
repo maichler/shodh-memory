@@ -212,11 +212,14 @@ pub fn analyze_multihop(inputs: &RunInputs, chains: usize) -> Result<MultiHopRep
             vals.iter().sum::<f64>() / vals.len() as f64
         }
     };
-    let mean_mrr = |records: &[crate::recall_harness::report::PerCaseRecord], cat: &str| -> f64 {
+    let mean_by = |records: &[crate::recall_harness::report::PerCaseRecord],
+                   cat: &str,
+                   sel: fn(&crate::recall_harness::report::PerCaseRecord) -> f64|
+     -> f64 {
         let vals: Vec<f64> = records
             .iter()
             .filter(|r| r.category == cat)
-            .map(|r| r.mrr)
+            .map(sel)
             .collect();
         if vals.is_empty() {
             0.0
@@ -234,7 +237,9 @@ pub fn analyze_multihop(inputs: &RunInputs, chains: usize) -> Result<MultiHopRep
                 layer: key,
                 multihop_recall_at_10: mean(records, "multi_hop"),
                 onehop_recall_at_10: mean(records, "single_hop"),
-                multihop_mrr: mean_mrr(records, "multi_hop"),
+                multihop_mrr: mean_by(records, "multi_hop", |r| r.mrr),
+                multihop_p_at_1: mean_by(records, "multi_hop", |r| r.p_at_1),
+                onehop_p_at_1: mean_by(records, "single_hop", |r| r.p_at_1),
             });
         }
     }

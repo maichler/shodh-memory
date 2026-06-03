@@ -175,6 +175,17 @@ pub struct MultiHopLayerRow {
     pub onehop_recall_at_10: f64,
     /// Mean MRR over the 2-hop cases.
     pub multihop_mrr: f64,
+    /// Mean P@1 over the 2-hop / capability cases. For controlled harnesses with
+    /// few equi-confusable candidates per query (temporal: 3 states; ontology:
+    /// 1 person + K orgs), recall@10 saturates at 1.0 because the whole confusable
+    /// set fits in the top-10 window — only P@1 (is the CAPABILITY-correct item
+    /// ranked #1 above its distractors?) discriminates. This is the headline
+    /// metric for those harnesses.
+    #[serde(default)]
+    pub multihop_p_at_1: f64,
+    /// Mean P@1 over the control cases.
+    #[serde(default)]
+    pub onehop_p_at_1: f64,
 }
 
 /// E3 controlled multi-hop report: per-layer 2-hop vs 1-hop recall over a

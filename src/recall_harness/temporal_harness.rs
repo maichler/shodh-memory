@@ -169,11 +169,14 @@ pub fn analyze_temporal(inputs: &RunInputs, subjects: usize) -> Result<MultiHopR
     };
     let out = run_smoke_suite_with_ranks(&run_inputs).context("temporal suite run failed")?;
 
-    let mean = |records: &[crate::recall_harness::report::PerCaseRecord], cat: &str| -> f64 {
+    let mean = |records: &[crate::recall_harness::report::PerCaseRecord],
+                cat: &str,
+                sel: fn(&crate::recall_harness::report::PerCaseRecord) -> f64|
+     -> f64 {
         let vals: Vec<f64> = records
             .iter()
             .filter(|r| r.category == cat)
-            .map(|r| r.recall_at_k)
+            .map(sel)
             .collect();
         if vals.is_empty() {
             0.0
@@ -187,9 +190,11 @@ pub fn analyze_temporal(inputs: &RunInputs, subjects: usize) -> Result<MultiHopR
         if let Some(records) = out.per_case_by_layer.get(&key) {
             rows.push(MultiHopLayerRow {
                 layer: key,
-                multihop_recall_at_10: mean(records, "temporal"),
-                onehop_recall_at_10: mean(records, "single_hop"),
-                multihop_mrr: 0.0,
+                multihop_recall_at_10: mean(records, "temporal", |r| r.recall_at_k),
+                onehop_recall_at_10: mean(records, "single_hop", |r| r.recall_at_k),
+                multihop_mrr: mean(records, "temporal", |r| r.mrr),
+                multihop_p_at_1: mean(records, "temporal", |r| r.p_at_1),
+                onehop_p_at_1: mean(records, "single_hop", |r| r.p_at_1),
             });
         }
     }
