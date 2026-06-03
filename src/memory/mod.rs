@@ -2323,6 +2323,45 @@ impl MemorySystem {
                         scored.into_iter().take(graph_expand_k).map(|(n, _)| n).collect();
                 }
 
+                // Causal-origin retrieval (SHODH_CAUSAL_ORIGIN). "What was the
+                // origin of C?" cannot be answered by spreading activation: it
+                // favours the proximal cause and only flows cause→effect. For
+                // origin-intent queries, walk causal edges BACKWARD from the query
+                // entities to the source(s) and append the source entity names as
+                // bridges — the root episode shares no lexical token with the
+                // effect-query, so this is what lets it surface on the BM25 leg.
+                // Requires causally-typed edges (SHODH_GRAPH_EXTRACTED_PREDICATES).
+                let causal_origin = std::env::var("SHODH_CAUSAL_ORIGIN")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if causal_origin && !query_entities.is_empty() {
+                    const ORIGIN_CUES: &[&str] = &[
+                        "root cause",
+                        "root of",
+                        "origin",
+                        "underlying",
+                        "earliest",
+                        "what led to",
+                        "what caused",
+                        "stem from",
+                        "stemmed from",
+                        "reason behind",
+                        "originate",
+                    ];
+                    let qt = query_text.to_lowercase();
+                    if ORIGIN_CUES.iter().any(|c| qt.contains(c)) {
+                        if let Ok(origins) = g.trace_causal_origins(&query_entities, 8) {
+                            for oid in origins {
+                                if let Ok(Some(ent)) = g.get_entity(&oid) {
+                                    if ent.name.trim().len() >= 2 {
+                                        graph_bridges.push(ent.name);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Calculate PER-ENTITY density (not global graph density)
                 // Sparse entities = trust graph, Dense entities = trust vector
                 let d = if !query_entities.is_empty() {

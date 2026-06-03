@@ -1490,6 +1490,13 @@ impl RelationType {
             Custom(_) => 1.0,
         }
     }
+
+    /// Whether this relation encodes forward causation (cause `from` → effect
+    /// `to`). Used by backward causal-origin tracing: to find the origin of an
+    /// effect, walk these edges from the effect (`to`) toward the cause (`from`).
+    pub fn is_causal(&self) -> bool {
+        matches!(self, RelationType::Causes | RelationType::Triggers | RelationType::ResultsIn)
+    }
 }
 
 /// Recover a typed relation from the surrounding text by relational cue phrases —
@@ -2950,6 +2957,66 @@ impl GraphMemory {
         }
 
         Ok(edges)
+    }
+
+    /// Trace the causal origin(s) of a set of effect entities — the "root cause".
+    ///
+    /// Spreading activation cannot answer "what was the origin of C?": it favours
+    /// the PROXIMAL cause (1 hop) over the distal root (2+ hops), and its per-edge
+    /// step hardcodes the `to_entity` as the target so it only flows forward
+    /// (cause → effect), never backward. This walks the OTHER way: from each effect
+    /// it follows incoming causal edges (where the current node is the `to_entity`
+    /// of a `Causes`/`Triggers`/`ResultsIn` edge) toward the `from_entity` cause,
+    /// repeatedly, and returns the terminal sources — the nodes with no further
+    /// causal antecedent. Those are the roots whose episodes answer the query.
+    ///
+    /// Requires causally-typed edges (see `extract_predicate_from_text` /
+    /// `SHODH_GRAPH_EXTRACTED_PREDICATES`); on a pure co-occurrence graph there are
+    /// no causal edges to walk and this correctly returns nothing.
+    pub fn trace_causal_origins(&self, seeds: &[Uuid], max_depth: usize) -> Result<Vec<Uuid>> {
+        use std::collections::HashSet;
+
+        let seed_set: HashSet<Uuid> = seeds.iter().copied().collect();
+        let mut visited: HashSet<Uuid> = HashSet::new();
+        let mut origins: Vec<Uuid> = Vec::new();
+        let mut origin_set: HashSet<Uuid> = HashSet::new();
+        let mut frontier: Vec<Uuid> = seeds.to_vec();
+
+        for _ in 0..max_depth.max(1) {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next: Vec<Uuid> = Vec::new();
+            for node in std::mem::take(&mut frontier) {
+                if !visited.insert(node) {
+                    continue;
+                }
+                let edges = self.get_entity_relationships_limited(&node, Some(64))?;
+                // Incoming causal edges: this node is the EFFECT (to_entity); the
+                // cause is the from_entity. Self-loops are skipped.
+                let parents: Vec<Uuid> = edges
+                    .iter()
+                    .filter(|e| {
+                        e.to_entity == node
+                            && e.from_entity != node
+                            && e.relation_type.is_causal()
+                    })
+                    .map(|e| e.from_entity)
+                    .collect();
+                if parents.is_empty() {
+                    // No causal antecedent → this is a source. A seed with no causal
+                    // parent is the query subject itself, not an origin, so skip it.
+                    if !seed_set.contains(&node) && origin_set.insert(node) {
+                        origins.push(node);
+                    }
+                } else {
+                    next.extend(parents);
+                }
+            }
+            frontier = next;
+        }
+
+        Ok(origins)
     }
 
     /// Calculate edge density for a specific entity (SHO-D5)
@@ -6958,6 +7025,53 @@ mod tests {
             extract_predicate_from_text("the sky is a colour today"),
             None
         );
+    }
+
+    #[test]
+    fn trace_causal_origins_walks_back_to_root() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let mk = |from: Uuid, to: Uuid, rt: RelationType| RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: from,
+            to_entity: to,
+            relation_type: rt,
+            strength: 0.8,
+            created_at: Utc::now(),
+            valid_at: Utc::now(),
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: Utc::now(),
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
+            tier: EdgeTier::L2Episodic,
+            entity_confidence: None,
+            forman_curvature: None,
+            endpoint_selectivity: None,
+        };
+        // Causal chain a → b → c (cause = from_entity).
+        graph
+            .add_relationship(mk(a, b, RelationType::Triggers))
+            .unwrap();
+        graph
+            .add_relationship(mk(b, c, RelationType::Triggers))
+            .unwrap();
+
+        // Origin of the effect c is the root a (walk c ← b ← a), NOT the proximal
+        // cause b. This is the exact failure mode spreading activation cannot solve.
+        assert_eq!(graph.trace_causal_origins(&[c], 8).unwrap(), vec![a]);
+
+        // A non-causal edge into c must NOT be followed (co-occurrence is not cause).
+        let d = Uuid::new_v4();
+        graph
+            .add_relationship(mk(d, c, RelationType::CoOccurs))
+            .unwrap();
+        assert_eq!(graph.trace_causal_origins(&[c], 8).unwrap(), vec![a]);
     }
 
     #[test]
