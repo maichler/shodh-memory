@@ -24,9 +24,21 @@ use crate::recall_harness::runner::{run_smoke_suite_with_ranks, RunInputs};
 
 pub const DEFAULT_ITEMS: usize = 40;
 
+// PERSONS and PLACES must be globally unique SINGLE tokens, one per item, so the
+// {place} localizer in the type-qualified query (and the {person} localizer in the
+// control) cannot lexically collide with another item's memories. They are 60+
+// long so `pick` never appends a block suffix for the default 60-item run — a
+// space-suffixed "Paris 1" would tokenize to ["paris","1"] and bleed onto item 0's
+// "Paris", silently corrupting P@1 (the bug this list size fixes). Persons must
+// stay real first names so NER types them PER (the gold the rerank must prefer).
 const PERSONS: &[&str] = &[
     "Alice", "Bob", "Carol", "David", "Emma", "Frank", "Grace", "Henry", "Iris", "Jack",
     "Karen", "Liam", "Mary", "Nora", "Oscar", "Paula", "Quinn", "Rachel", "Sam", "Tina",
+    "Ursula", "Victor", "Wendy", "Xavier", "Yolanda", "Zachary", "Adam", "Brenda", "Caleb",
+    "Diana", "Ethan", "Fiona", "George", "Hannah", "Ian", "Julia", "Kevin", "Laura", "Marcus",
+    "Natalie", "Owen", "Priya", "Quincy", "Rosa", "Steven", "Tara", "Umar", "Vera", "Walter",
+    "Ximena", "Yusuf", "Zoe", "Aaron", "Bella", "Carlos", "Delia", "Elena", "Felix", "Gloria",
+    "Hugo",
 ];
 const ORGS: &[&str] = &[
     "Acme Corporation", "Globex Corporation", "Initech", "Umbrella Corporation",
@@ -37,7 +49,11 @@ const ORGS: &[&str] = &[
 const PLACES: &[&str] = &[
     "Paris", "Tokyo", "Berlin", "Madrid", "Rome", "Cairo", "Lima", "Oslo", "Vienna", "Dublin",
     "Lisbon", "Athens", "Prague", "Warsaw", "Helsinki", "Bangkok", "Seoul", "Boston", "Denver",
-    "Seattle",
+    "Seattle", "Toronto", "Sydney", "Mumbai", "Munich", "Geneva", "Zurich", "Brussels", "Amsterdam",
+    "Copenhagen", "Stockholm", "Budapest", "Bucharest", "Belgrade", "Naples", "Venice", "Florence",
+    "Porto", "Valencia", "Seville", "Glasgow", "Manchester", "Liverpool", "Bristol", "Portland",
+    "Austin", "Dallas", "Houston", "Phoenix", "Atlanta", "Miami", "Chicago", "Detroit", "Cleveland",
+    "Pittsburgh", "Baltimore", "Richmond", "Nashville", "Memphis", "Orlando", "Tampa",
 ];
 
 fn pick(list: &[&str], i: usize) -> String {
@@ -46,7 +62,10 @@ fn pick(list: &[&str], i: usize) -> String {
     if block == 0 {
         base.to_string()
     } else {
-        format!("{base} {block}")
+        // Past the list length tokens would start colliding; the generator clamps
+        // `items` to the list length so this branch is unreachable for the localizer
+        // lists. No-space suffix keeps any incidental use as a distinct token.
+        format!("{base}{block}")
     }
 }
 
@@ -57,6 +76,21 @@ fn pick(list: &[&str], i: usize) -> String {
 const DISTRACTORS_PER_ITEM: usize = 3;
 
 pub fn generate_ontology_fixtures(items: usize) -> (Vec<CorpusItem>, Vec<SmokeCase>) {
+    // Clamp to the localizer-list length: beyond it, `pick` would reuse a base
+    // token across items and the {place}/{person} localizers would collide, so two
+    // items' persons would both answer one query (an unlabeled-correct distractor)
+    // and silently corrupt P@1. Better a smaller clean sample than a larger dirty
+    // one — surface the cap loudly rather than quietly degrade.
+    let max_clean = PERSONS.len().min(PLACES.len());
+    let items = if items > max_clean {
+        eprintln!(
+            "ontology harness: clamping items {items} → {max_clean} (localizer lists exhausted; \
+             larger N would collide place/person tokens and corrupt P@1)"
+        );
+        max_clean
+    } else {
+        items
+    };
     let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
     let mut corpus: Vec<CorpusItem> = Vec::with_capacity(items * (DISTRACTORS_PER_ITEM + 1));
     let mut cases: Vec<SmokeCase> = Vec::with_capacity(items * 2);

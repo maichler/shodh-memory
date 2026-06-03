@@ -62,7 +62,11 @@ pub fn generate_temporal_fixtures(subjects: usize) -> (Vec<CorpusItem>, Vec<Smok
     // year strictly between state[0] and state[1], so the gold is state[0] and the
     // queried year appears in NO memory (no lexical year match for any candidate).
     const STATE_YEARS: [u32; 3] = [2013, 2017, 2021];
-    const QUERY_YEAR: u32 = 2015; // 2013 < 2015 < 2017 → gold = the 2013 state
+    // T sits CLOSER to the later state (2017) but strictly before it, so a naive
+    // nearest-year heuristic answers 2017 (WRONG) and only correct "most-recent
+    // state ≤ T" semantics answers 2013 (gold = state[0]). 2015 would be
+    // equidistant from 2013/2017 and let nearest-year score 50% by luck.
+    const QUERY_YEAR: u32 = 2016; // 2013 < 2016 < 2017 → valid-at-2016 = the 2013 state
     let roles = [EARLY_ROLES, LATE_ROLES].concat();
 
     let mut corpus: Vec<CorpusItem> = Vec::with_capacity(subjects * 3);
