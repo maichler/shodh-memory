@@ -1,16 +1,20 @@
-//! Temporal controlled harness — planted time-varying facts.
+//! Temporal controlled harness — planted time-varying facts (adversarial).
 //!
-//! Tests temporal reasoning directly: for each subject, an attribute CHANGES over
-//! time (e.g. "in 2019 X was a pilot" → "in 2022 X became a captain"). A query
-//! asks for the attribute at an intermediate time ("what was X in 2020?"). The
-//! gold is the EARLIER memory (the fact valid at the queried time), NOT the latest
-//! — so a system that just returns the most recent / most lexically-similar
-//! memory fails, and only the temporal-fact layer (Layer 0.6, now populated by the
-//! remember()-path fact storage + the consolidation cycle) gets it right.
+//! Tests temporal reasoning under the adversarial-isolation standard: each subject
+//! has THREE equi-lexical time-states of one attribute (identical sentence frame,
+//! differing only in {year}/{role}) at well-separated years. The valid-at-T query
+//! asks for the state at an INTERMEDIATE year that appears in NO memory, so BM25 /
+//! vector see three equally-good candidates (chance ≈ 1/3) and only date-interval
+//! logic — "the state in force at T is the most recent state ≤ T" — picks the gold
+//! (state[0]). A system that returns the latest, or the most lexically similar,
+//! fails. A lexical control names an exact state year (BM25-solvable) to prove the
+//! corpus is retrievable; the valid-at-T − control gap isolates the temporal layer.
+//!
+//! This replaces a v1 generator whose query lexically matched the gold, ceilinged
+//! recall at 1.0 across every layer, and therefore measured BM25, not temporality.
 //!
 //! Deterministic, model-free. Run through every LayerMode so the +facts delta on
-//! the temporal cases is the temporal layer's isolated contribution — the thing a
-//! plain recall@k Temporal category cannot isolate.
+//! the valid-at-T cases is the temporal layer's isolated contribution.
 
 use std::path::PathBuf;
 
@@ -22,8 +26,8 @@ use crate::recall_harness::fixtures::{CorpusItem, RelevanceJudgement, SmokeCase,
 use crate::recall_harness::report::{MultiHopLayerRow, MultiHopReport};
 use crate::recall_harness::runner::{run_smoke_suite_with_ranks, RunInputs};
 
-/// Default number of planted temporal subjects. Each yields 2 memories (early,
-/// late) + 1 "valid-at-T" query and 1 "latest" control query.
+/// Default number of planted temporal subjects. Each yields 3 equi-lexical time-
+/// state memories + 1 "valid-at-T" query and 1 lexical control query.
 pub const DEFAULT_SUBJECTS: usize = 60;
 
 const NAMES: &[&str] = &[
@@ -44,62 +48,64 @@ fn name(n: usize) -> String {
     }
 }
 
-/// Generate planted temporal fixtures. Subject `i` is a {pilot in 2018+i%3}…
-/// design where early year < query year < late year, so the gold for the
-/// valid-at-T query is unambiguously the EARLY memory.
+/// Generate ADVERSARIAL temporal fixtures. Each subject has THREE equi-lexical
+/// time-states of the same attribute — identical phrasing except {year} and
+/// {role} — at well-separated years. The valid-at-T query asks for the role at an
+/// intermediate year that matches NONE of the three lexically, so BM25/vector see
+/// three equally-good candidates (recall ~1/3 by chance) and only date-interval
+/// logic ("the state in force at T is the most recent state ≤ T") can pick the
+/// gold. A lexical control names the exact year (BM25-solvable) to prove the
+/// corpus is retrievable. This is the standard the v1 generator failed.
 pub fn generate_temporal_fixtures(subjects: usize) -> (Vec<CorpusItem>, Vec<SmokeCase>) {
     let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-    let mut corpus: Vec<CorpusItem> = Vec::with_capacity(subjects * 2);
+    // Three states at fixed, well-separated years. The valid-at-T query uses a
+    // year strictly between state[0] and state[1], so the gold is state[0] and the
+    // queried year appears in NO memory (no lexical year match for any candidate).
+    const STATE_YEARS: [u32; 3] = [2013, 2017, 2021];
+    const QUERY_YEAR: u32 = 2015; // 2013 < 2015 < 2017 → gold = the 2013 state
+    let roles = [EARLY_ROLES, LATE_ROLES].concat();
+
+    let mut corpus: Vec<CorpusItem> = Vec::with_capacity(subjects * 3);
     let mut cases: Vec<SmokeCase> = Vec::with_capacity(subjects * 2);
 
     for i in 0..subjects {
         let subj = name(i);
-        let early_role = EARLY_ROLES[i % EARLY_ROLES.len()];
-        let late_role = LATE_ROLES[i % LATE_ROLES.len()];
-        // Fixed, well-separated years so "valid at T" is unambiguous.
-        let early_year = 2017;
-        let query_year = 2019;
-        let late_year = 2021;
+        let mut state_ids = Vec::with_capacity(3);
+        for (s, &year) in STATE_YEARS.iter().enumerate() {
+            // Distinct role per state, but IDENTICAL sentence frame so the three
+            // states are equi-lexical except {year}/{role}.
+            let role = roles[(i + s) % roles.len()];
+            let id = format!("temp-s{s}-{i:04}");
+            corpus.push(CorpusItem {
+                id: id.clone(),
+                content: format!("In {year}, {subj}'s assignment was {role}."),
+                memory_type: "fact".to_string(),
+                tags: vec![subj.clone()],
+                created_at: base + chrono::Duration::minutes(3 * i as i64 + s as i64),
+            });
+            state_ids.push(id);
+        }
 
-        let early_id = format!("temp-early-{i:04}");
-        let late_id = format!("temp-late-{i:04}");
-
-        corpus.push(CorpusItem {
-            id: early_id.clone(),
-            content: format!("In {early_year}, {subj} worked as a {early_role}."),
-            memory_type: "fact".to_string(),
-            tags: vec![subj.clone()],
-            created_at: base + chrono::Duration::minutes(2 * i as i64),
-        });
-        corpus.push(CorpusItem {
-            id: late_id.clone(),
-            content: format!("In {late_year}, {subj} was promoted to {late_role}."),
-            memory_type: "fact".to_string(),
-            tags: vec![subj.clone()],
-            created_at: base + chrono::Duration::minutes(2 * i as i64 + 1),
-        });
-
-        // Valid-at-T: the gold is the EARLY memory (the fact true in query_year).
-        // A "return the latest" system returns the late memory and fails.
+        // Valid-at-T: queried year (2015) matches no memory; gold = state[0] (2013,
+        // the most recent state ≤ 2015). Only temporal interval logic resolves it.
         cases.push(SmokeCase {
             id: format!("temp-validT-{i:04}"),
             category: SmokeCategory::Temporal,
-            query: format!("What did {subj} do in {query_year}?"),
+            query: format!("What was {subj}'s assignment in {QUERY_YEAR}?"),
             fixture_corpus_id: "temporal".to_string(),
             relevant: vec![RelevanceJudgement {
-                corpus_item_id: early_id,
+                corpus_item_id: state_ids[0].clone(),
                 grade: 3,
             }],
         });
-        // Latest control: asks for the current/most-recent role; gold = late memory.
-        // BM25/recency should solve this — the contrast that isolates temporal reasoning.
+        // Lexical control: names an exact state year (2017) → BM25-solvable.
         cases.push(SmokeCase {
-            id: format!("temp-latest-{i:04}"),
+            id: format!("temp-ctrl-{i:04}"),
             category: SmokeCategory::SingleHop,
-            query: format!("What was {subj} promoted to?"),
+            query: format!("In {}, what was {subj}'s assignment?", STATE_YEARS[1]),
             fixture_corpus_id: "temporal".to_string(),
             relevant: vec![RelevanceJudgement {
-                corpus_item_id: late_id,
+                corpus_item_id: state_ids[1].clone(),
                 grade: 3,
             }],
         });
@@ -133,10 +139,10 @@ fn write_fixtures(
 }
 
 /// Build the planted temporal corpus, run it through every LayerMode, and report
-/// per-layer recall on the valid-at-T cases (temporal) vs the latest-control
+/// per-layer recall on the valid-at-T cases (temporal) vs the lexical control
 /// cases. The +facts delta on valid-at-T = the temporal-fact layer's isolated
 /// contribution. Reuses the multi-hop report shape (multihop_* = valid-at-T,
-/// onehop_* = latest control).
+/// onehop_* = lexical control).
 pub fn analyze_temporal(inputs: &RunInputs, subjects: usize) -> Result<MultiHopReport> {
     let (corpus, cases) = generate_temporal_fixtures(subjects);
     let validt_cases = cases

@@ -50,52 +50,65 @@ fn pick(list: &[&str], i: usize) -> String {
     }
 }
 
+/// Number of ORG distractors planted per item. With K orgs sharing the exact same
+/// sentence frame + place as the single person, BM25/vector see K+1 equally-good
+/// candidates for the type-qualified query, so the shortcut baseline is ~1/(K+1)
+/// and ONLY entity-type can lift the person above the orgs.
+const DISTRACTORS_PER_ITEM: usize = 3;
+
 pub fn generate_ontology_fixtures(items: usize) -> (Vec<CorpusItem>, Vec<SmokeCase>) {
     let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-    let mut corpus: Vec<CorpusItem> = Vec::with_capacity(items * 2);
+    let mut corpus: Vec<CorpusItem> = Vec::with_capacity(items * (DISTRACTORS_PER_ITEM + 1));
     let mut cases: Vec<SmokeCase> = Vec::with_capacity(items * 2);
 
     for i in 0..items {
         let person = pick(PERSONS, i);
-        let org = pick(ORGS, i);
         let place = pick(PLACES, i);
-
         let person_id = format!("onto-person-{i:04}");
-        let org_id = format!("onto-org-{i:04}");
+
+        // EQUI-LEXICAL frame: the person and every org distractor use the IDENTICAL
+        // sentence — "<entity> was registered for the <place> trade summit." — so
+        // the ONLY thing that distinguishes them is the entity's TYPE. No content
+        // word (conference/office) can be used as a lexical shortcut.
+        let frame = |entity: &str| format!("{entity} was registered for the {place} trade summit.");
 
         corpus.push(CorpusItem {
             id: person_id.clone(),
-            content: format!("{person} attended the conference in {place}."),
+            content: frame(&person),
             memory_type: "fact".to_string(),
             tags: vec![],
-            created_at: base + chrono::Duration::minutes(2 * i as i64),
+            created_at: base + chrono::Duration::minutes(8 * i as i64),
         });
-        corpus.push(CorpusItem {
-            id: org_id.clone(),
-            content: format!("{org} opened a new office in {place}."),
-            memory_type: "fact".to_string(),
-            tags: vec![],
-            created_at: base + chrono::Duration::minutes(2 * i as i64 + 1),
-        });
+        for d in 0..DISTRACTORS_PER_ITEM {
+            // Stride the org list so each item's distractors are distinct orgs.
+            let org = pick(ORGS, i + 1 + d * 7);
+            corpus.push(CorpusItem {
+                id: format!("onto-org-{i:04}-{d}"),
+                content: frame(&org),
+                memory_type: "fact".to_string(),
+                tags: vec![],
+                created_at: base + chrono::Duration::minutes(8 * i as i64 + 1 + d as i64),
+            });
+        }
 
-        // Type-qualified: both memories share {place}; only TYPE distinguishes the
-        // person memory (gold) from the org memory. Uses SmokeCategory::Entity.
+        // Type-qualified: all K+1 memories share {place}+frame; only the entity TYPE
+        // distinguishes the person (gold) from the K orgs. SmokeCategory::Entity.
         cases.push(SmokeCase {
             id: format!("onto-type-{i:04}"),
             category: SmokeCategory::Entity,
-            query: format!("Which person was in {place}?"),
+            query: format!("Which person was registered for the {place} trade summit?"),
             fixture_corpus_id: "ontology".to_string(),
             relevant: vec![RelevanceJudgement {
                 corpus_item_id: person_id.clone(),
                 grade: 3,
             }],
         });
-        // Control: a direct lexical query for the person memory (BM25-solvable),
-        // so the type-qualified vs control gap isolates the ontology rerank.
+        // Control: name the person directly (BM25-solvable) → proves the corpus is
+        // retrievable, so the type-qualified vs control gap isolates the rerank.
         cases.push(SmokeCase {
             id: format!("onto-ctrl-{i:04}"),
             category: SmokeCategory::Code,
-            query: format!("Who attended the conference in {place}?"),
+            query: format!("What was {person} registered for?"),
             fixture_corpus_id: "ontology".to_string(),
             relevant: vec![RelevanceJudgement {
                 corpus_item_id: person_id,

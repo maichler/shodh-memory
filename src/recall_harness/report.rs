@@ -103,6 +103,33 @@ pub struct DecayReport {
     pub rows: Vec<DecayRow>,
 }
 
+/// One age point in the SELECTIVE-forgetting curve. For each age, `important_*`
+/// and `trivial_*` are retention rates (recall@10) of the reinforced vs the
+/// never-reinforced population under the SAME query; `divergence` =
+/// important − trivial. A real cognitive memory keeps `important_retention` high
+/// while `trivial_retention` decays, so `divergence` GROWS with age. Equal decay
+/// (divergence flat near 0) means forgetting is indiscriminate — the failure the
+/// global stability curve cannot see.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SelectiveForgettingRow {
+    pub age_days: f64,
+    pub important_retention: f64,
+    pub trivial_retention: f64,
+    pub divergence: f64,
+}
+
+/// Selective-forgetting report: retention divergence (important − trivial) vs age.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SelectiveForgettingReport {
+    pub suite: String,
+    pub git_sha: String,
+    /// Reinforcement cycles applied to each important memory before aging.
+    pub reinforce_cycles: usize,
+    /// Number of (important, trivial) competitive pairs.
+    pub pairs: usize,
+    pub rows: Vec<SelectiveForgettingRow>,
+}
+
 /// One row in the unified ablation matrix: a named config (a set of query-time
 /// flag overrides) and its aggregate metrics over the suite. The whole point is
 /// a single, re-runnable table where each fix/component is a row you can see and

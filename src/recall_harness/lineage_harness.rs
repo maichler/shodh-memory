@@ -53,29 +53,33 @@ pub fn generate_lineage_fixtures(chains: usize) -> (Vec<CorpusItem>, Vec<SmokeCa
         let root_id = format!("lin-root-{i:04}");
         let mid_id = format!("lin-mid-{i:04}");
 
-        // root: a caused b. (does NOT mention c)
+        // root: a → b. Does NOT mention c, and — crucially — carries NO "root
+        // cause"/"underlying" phrase that the query also uses. The only token it
+        // shares with the c-query is reachable solely by traversing c ← b ← a.
         corpus.push(CorpusItem {
             id: root_id.clone(),
-            content: format!("{a} was the root cause that triggered {b}."),
+            content: format!("{a} set {b} in motion."),
             memory_type: "fact".to_string(),
             tags: vec![a.clone(), b.clone()],
             created_at: base + chrono::Duration::minutes(2 * i as i64),
         });
-        // mid: b caused c.
+        // mid: b → c. Mentions c, so it is the tempting DIRECT-cause distractor the
+        // root-cause query must traverse PAST (it is the gold for the control only).
         corpus.push(CorpusItem {
             id: mid_id.clone(),
-            content: format!("{b} in turn led directly to {c}."),
+            content: format!("{b} then brought about {c}."),
             memory_type: "fact".to_string(),
             tags: vec![b.clone(), c.clone()],
             created_at: base + chrono::Duration::minutes(2 * i as i64 + 1),
         });
 
-        // Root-cause case: "what was the root cause of c?" → gold = root memory
-        // (a→b), which never mentions c. Reachable only by chaining c←b←a.
+        // Root-cause case: gold = root (a→b), which never mentions c and shares no
+        // discriminative phrase with the query. Reachable only by chaining c←b←a.
+        // The mid memory (mentions c) is the hard negative it must rank below root.
         cases.push(SmokeCase {
             id: format!("lin-why-{i:04}"),
             category: SmokeCategory::MultiHop,
-            query: format!("What was the root cause behind {c}?"),
+            query: format!("What was the earliest origin behind {c}?"),
             fixture_corpus_id: "lineage".to_string(),
             relevant: vec![RelevanceJudgement {
                 corpus_item_id: root_id,
@@ -86,7 +90,7 @@ pub fn generate_lineage_fixtures(chains: usize) -> (Vec<CorpusItem>, Vec<SmokeCa
         cases.push(SmokeCase {
             id: format!("lin-direct-{i:04}"),
             category: SmokeCategory::SingleHop,
-            query: format!("What led directly to {c}?"),
+            query: format!("What immediately brought about {c}?"),
             fixture_corpus_id: "lineage".to_string(),
             relevant: vec![RelevanceJudgement {
                 corpus_item_id: mid_id,

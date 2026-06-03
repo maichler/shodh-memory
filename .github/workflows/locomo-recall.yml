@@ -31,7 +31,7 @@ on:
         required: false
         default: ''
       mode:
-        description: 'What to run: recall (default) | reachability | learning_curve | multi_hop | ablation | temporal | ontology | lineage | forgetting'
+        description: 'What to run: recall (default) | reachability | learning_curve | multi_hop | ablation | temporal | ontology | lineage | forgetting | selective_forgetting'
         required: false
         default: 'recall'
       suite:
@@ -237,6 +237,14 @@ jobs:
           ./target/release/recall-eval             --suite locomo             --forgetting forgetting.json             --output unused-recall.json             --storage ./forgetting-storage 2>&1 | tee forgetting.log
           echo "## Decay/forgetting stability (E6)" >> "$GITHUB_STEP_SUMMARY"
           sed -n '/^## /,$p' forgetting.log | tail -n +1 >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Selective forgetting (E6b)
+        if: ${{ github.event.inputs.mode == 'selective_forgetting' }}
+        run: |
+          for kv in ${{ github.event.inputs.extra_env }}; do export "$kv"; done
+          ./target/release/recall-eval             --suite locomo             --selective-forgetting selective.json             --output unused-recall.json             --storage ./selective-storage 2>&1 | tee selective.log
+          echo "## Selective forgetting (E6b)" >> "$GITHUB_STEP_SUMMARY"
+          sed -n '/## Selective forgetting/,$p' selective.log >> "$GITHUB_STEP_SUMMARY" || true
 
       - name: Temporal controlled diagnostic
         if: ${{ github.event.inputs.mode == 'temporal' }}

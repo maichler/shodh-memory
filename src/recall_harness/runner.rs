@@ -642,7 +642,7 @@ pub const EVAL_USER: &str = "recall-eval";
 /// harness measured the pipeline with the ENTIRE knowledge-graph / spreading-
 /// activation / lineage / ontology layer disabled. The manager wires a per-user
 /// graph + NER, so the eval exercises the same ingest path production does.
-fn build_manager(storage_path: &Path) -> Result<MultiUserMemoryManager> {
+pub(crate) fn build_manager(storage_path: &Path) -> Result<MultiUserMemoryManager> {
     std::fs::create_dir_all(storage_path)
         .with_context(|| format!("creating storage dir {}", storage_path.display()))?;
     MultiUserMemoryManager::new(storage_path.to_path_buf(), ServerConfig::default())

@@ -22,7 +22,7 @@ use shodh_memory::memory::types::LayerMode;
 use shodh_memory::recall_harness::multihop::analyze_multihop;
 use shodh_memory::recall_harness::report::{
     compare_to_baseline, AblationReport, DecayReport, LearningCurveReport, MultiHopReport,
-    ReachabilityReport, Report,
+    ReachabilityReport, Report, SelectiveForgettingReport,
 };
 use shodh_memory::recall_harness::runner::{
     analyze_ablation, analyze_graph_reachability, analyze_learning_curve,
@@ -225,6 +225,12 @@ struct Args {
     #[arg(long)]
     forgetting: Option<PathBuf>,
 
+    /// E6b selective forgetting: competitive important-vs-trivial populations under
+    /// one query; reports retention divergence (important − trivial) vs age. A real
+    /// cognitive memory grows the divergence; indiscriminate decay keeps it ~0.
+    #[arg(long)]
+    selective_forgetting: Option<PathBuf>,
+
     /// E5 ontology: planted type-disambiguation (person vs org sharing a place);
     /// the +rerank delta on the type-qualified cases isolates the ontology layer.
     #[arg(long)]
@@ -390,6 +396,37 @@ fn run(args: &Args) -> Result<i32> {
             );
         }
         println!("\nFlat = stable memory (good homeostasis); a cliff = catastrophic forgetting from edge decay.");
+        return Ok(EXIT_PASS);
+    }
+
+    // E6b selective forgetting: important-vs-trivial retention divergence vs age.
+    if let Some(sf_path) = &args.selective_forgetting {
+        use shodh_memory::recall_harness::forgetting_harness as fh;
+        let cycles = std::env::var("SHODH_SELECTIVE_REINFORCE_CYCLES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(fh::DEFAULT_REINFORCE_CYCLES);
+        let report =
+            fh::analyze_selective_forgetting(&inputs, fh::DEFAULT_GROUPS, fh::DEFAULT_AGES, cycles)
+                .context("selective forgetting analysis")?;
+        write_selective(sf_path, &report)?;
+        eprintln!(
+            "recall-eval: selective forgetting (suite={}, pairs={}, cycles={})",
+            report.suite, report.pairs, report.reinforce_cycles
+        );
+        println!(
+            "## Selective forgetting — important vs trivial retention ({}, {} pairs, {} reinforce cycles)\n",
+            report.suite, report.pairs, report.reinforce_cycles
+        );
+        println!("| age (days) | important@{} | trivial@{} | divergence |", 6, 6);
+        println!("| --- | --- | --- | --- |");
+        for r in &report.rows {
+            println!(
+                "| {:.0} | {:.4} | {:.4} | {:+.4} |",
+                r.age_days, r.important_retention, r.trivial_retention, r.divergence
+            );
+        }
+        println!("\nDivergence GROWING with age = selective forgetting (retains important, drops trivial). Flat ~0 = indiscriminate decay.");
         return Ok(EXIT_PASS);
     }
 
@@ -695,6 +732,20 @@ fn write_decay(path: &std::path::Path, report: &DecayReport) -> Result<()> {
     let json = serde_json::to_vec_pretty(report).context("serialising decay report")?;
     std::fs::write(path, &json)
         .with_context(|| format!("writing decay report to {}", path.display()))?;
+    Ok(())
+}
+
+fn write_selective(path: &std::path::Path, report: &SelectiveForgettingReport) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating output dir {}", parent.display()))?;
+        }
+    }
+    let json =
+        serde_json::to_vec_pretty(report).context("serialising selective-forgetting report")?;
+    std::fs::write(path, &json)
+        .with_context(|| format!("writing selective-forgetting report to {}", path.display()))?;
     Ok(())
 }
 
