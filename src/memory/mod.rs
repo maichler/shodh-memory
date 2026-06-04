@@ -2850,8 +2850,19 @@ impl MemorySystem {
                 .map(|(_, a, _)| *a)
                 .fold(0.0_f32, f32::max)
                 .max(1e-6);
+            // FUSION_V2 (SHODH_FUSION_V2): weighted-Borda consensus backbone + a
+            // calibrated graph-exclusive rescue. Borda gives a leg's rank-1 ~FULL
+            // leg weight (w·(N-rank)/N) instead of the RRF crumb w/(k+rank); the
+            // rescue lets a CONFIDENT graph-only hit (high activation, absent from
+            // the hybrid top window) exceed the consensus crowd — the single-witness
+            // case RRF structurally buries. Grounded in the dataflow map (the
+            // double-RRF crumb burial at this exact fusion) + the RRF scale-
+            // invariance lesson. Default off; RRF unchanged when unset.
+            let v2_fusion = std::env::var("SHODH_FUSION_V2")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
             let hybrid_top: std::collections::HashSet<MemoryId> =
-                if graph_act_add > 0.0 || graph_reserve_final > 0 {
+                if graph_act_add > 0.0 || graph_reserve_final > 0 || v2_fusion {
                     hybrid_ids
                         .iter()
                         .take(query.max_results.max(1))
@@ -2890,10 +2901,24 @@ impl MemorySystem {
                 .map(|(_, s)| *s)
                 .fold(0.0_f32, f32::max)
                 .max(1e-6);
+            // Leg sizes for Borda normalisation (legs are already rank-sorted here).
+            let n_graph = graph_results.len().max(1) as f32;
+            let n_hybrid = hybrid_ids.len().max(1) as f32;
 
             // Graph leg.
             for (r, (id, activation, h)) in graph_results.iter().enumerate() {
-                let rrf_score = if actr_fusion {
+                let rrf_score = if v2_fusion {
+                    // Borda (rank-1 ≈ full graph_w) + CONFIDENCE rescue: every graph
+                    // candidate gets graph_w·(activation/max) added, so a strongly
+                    // activated hit reaches up to 2·graph_w and can beat a lexical
+                    // distractor even when it is PRESENT-but-buried in the hybrid
+                    // pool. (The old `!hybrid_top` gate only rescued answers wholly
+                    // absent from hybrid — local observation showed it never fired
+                    // for the common burial case.)
+                    let borda = graph_w * ((n_graph - r as f32) / n_graph);
+                    let rescue = graph_w * (activation / max_activation).clamp(0.0, 1.0);
+                    borda + rescue
+                } else if actr_fusion {
                     // Calibrated magnitude: the graph's best hit enters at graph_w,
                     // not a graph_w/(k+rank) crumb.
                     graph_w * (activation / max_activation).clamp(0.0, 1.0)
@@ -2904,8 +2929,8 @@ impl MemorySystem {
                 *fused.entry(id.clone()).or_insert(0.0) += rrf_score;
                 heb.insert(id.clone(), *h);
 
-                // Multiplicative activation bonus (RRF-only; no-op under ACT-R).
-                let activation_factor = if actr_fusion {
+                // Multiplicative activation bonus (RRF-only; no-op under ACT-R / V2).
+                let activation_factor = if actr_fusion || v2_fusion {
                     1.0
                 } else {
                     1.0 + graph_w
@@ -2954,7 +2979,10 @@ impl MemorySystem {
 
             // Hybrid (BM25+vector) leg.
             for (r, (id, hybrid_raw)) in hybrid_ids.iter().enumerate() {
-                let hybrid_rrf = if actr_fusion {
+                let hybrid_rrf = if v2_fusion {
+                    // Borda: rank-1 ≈ full hybrid_w (scale-invariant, no crumb).
+                    hybrid_w * ((n_hybrid - r as f32) / n_hybrid)
+                } else if actr_fusion {
                     // Calibrated magnitude, parallel to the graph leg.
                     hybrid_w * (hybrid_raw / max_hybrid).clamp(0.0, 1.0)
                 } else {
@@ -3772,26 +3800,43 @@ impl MemorySystem {
         // Linguistic analysis: additive boost (5% of IC weight), not a full re-sort
         // RH-8 gate: linguistic re-sort only runs in `Full` mode.
         if layer_full && !query_analysis.focal_entities.is_empty() {
-            // Precompute the boosted score once per memory. Computing
-            // linguistic_boost inside the comparator re-scanned each memory's
-            // content O(n log n) times (twice per comparison); now it is O(n).
-            let boosted: std::collections::HashMap<MemoryId, f32> = memories
-                .iter()
-                .map(|m| {
-                    let key = m.score.unwrap_or(0.0)
-                        + Self::linguistic_boost(&m.experience.content, &query_analysis) * 0.05;
-                    (m.id.clone(), key)
-                })
-                .collect();
-            memories.sort_by(|a, b| {
-                let score_a = boosted.get(&a.id).copied().unwrap_or(0.0);
-                let score_b = boosted.get(&b.id).copied().unwrap_or(0.0);
-                // Score desc → recency desc → MemoryId asc for stable rank order.
-                score_b
-                    .total_cmp(&score_a)
-                    .then_with(|| b.created_at.cmp(&a.created_at))
-                    .then_with(|| a.id.cmp(&b.id))
-            });
+            let v2_single = std::env::var("SHODH_FUSION_V2")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if v2_single {
+                // Conscious restructure: FOLD the linguistic signal into the single
+                // .score (additive) instead of a separate sort-only re-rank that the
+                // final sort silently discards when len>max. One score, one sort.
+                for m in memories.iter_mut() {
+                    if let Some(s) = m.score {
+                        let add = Self::linguistic_boost(&m.experience.content, &query_analysis)
+                            * 0.05;
+                        let mut cloned: Memory = m.as_ref().clone();
+                        cloned.set_score(s + add);
+                        *m = Arc::new(cloned);
+                    }
+                }
+            } else {
+                // Legacy: sort-only re-rank by (score + linguistic). Precompute the
+                // key once per memory (computing it in the comparator re-scanned
+                // content O(n log n) times).
+                let boosted: std::collections::HashMap<MemoryId, f32> = memories
+                    .iter()
+                    .map(|m| {
+                        let key = m.score.unwrap_or(0.0)
+                            + Self::linguistic_boost(&m.experience.content, &query_analysis) * 0.05;
+                        (m.id.clone(), key)
+                    })
+                    .collect();
+                memories.sort_by(|a, b| {
+                    let score_a = boosted.get(&a.id).copied().unwrap_or(0.0);
+                    let score_b = boosted.get(&b.id).copied().unwrap_or(0.0);
+                    score_b
+                        .total_cmp(&score_a)
+                        .then_with(|| b.created_at.cmp(&a.created_at))
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+            }
         }
 
         self.logger
@@ -3949,8 +3994,14 @@ impl MemorySystem {
         }
 
         // Re-sort by score and trim to max_results after expansion.
-        // Expanded memories must compete on score, not get a free pass.
-        if memories.len() > query.max_results {
+        // Conscious restructure (SHODH_FUSION_V2): this is the SINGLE arbiter — the
+        // linguistic signal is already folded into .score above — so sort by .score
+        // UNCONDITIONALLY, not only when len>max. That branch is what let result-set
+        // SIZE decide whether the lexical re-sort or .score won the final order.
+        let v2_single_sort = std::env::var("SHODH_FUSION_V2")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if v2_single_sort || memories.len() > query.max_results {
             // Score desc → recency desc → MemoryId asc — deterministic competition cutoff.
             memories.sort_by(|a, b| {
                 b.score

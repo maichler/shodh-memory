@@ -1451,6 +1451,162 @@ mod tests {
         );
     }
 
+    /// OBSERVATION (G3 debug): the harness shows ACTR_FUSION changing the
+    /// `vamana_only` ranking, but reading the code says it cannot (graph leg empty,
+    /// overlays gated off, both fusions monotonic in the vector score). Rather than
+    /// keep predicting, run the real recall path both ways on a tiny known corpus
+    /// and PRINT the orderings, so the divergence is observed, not inferred.
+    #[test]
+    fn observe_actr_fusion_vamana_only_ranking() {
+        use crate::recall_harness::fixtures::CorpusItem;
+        use chrono::{Duration, TimeZone, Utc};
+
+        let storage = unique_storage_dir("actr-observe");
+        let manager = build_manager(&storage).unwrap();
+        let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let mk = |id: &str, content: &str, i: i64| CorpusItem {
+            id: id.to_string(),
+            content: content.to_string(),
+            memory_type: "fact".to_string(),
+            tags: vec![],
+            created_at: base + Duration::minutes(i),
+        };
+        // Competing vector matches: c0/c4 both share "brown"; query favours c0.
+        let corpus = vec![
+            mk("c0", "The brown fox leaps over the lazy dog in the meadow", 0),
+            mk("c1", "A red car drove down the busy city highway at night", 1),
+            mk("c2", "The chef prepared a delicious pasta with fresh basil", 2),
+            mk("c3", "Quantum computers use qubits for parallel computation", 3),
+            mk("c4", "The brown bear caught a salmon in the rushing river", 4),
+            mk("c5", "She painted a vivid sunset over the calm blue ocean", 5),
+        ];
+        let id_map = ingest_corpus(&manager, &corpus).unwrap();
+        let rev: HashMap<Uuid, String> =
+            id_map.iter().map(|(cid, u)| (*u, cid.clone())).collect();
+        let system = manager.get_user_memory(EVAL_USER).unwrap();
+
+        let recall_order = |q: &str| -> Vec<(String, f32)> {
+            let query = Query {
+                query_text: Some(q.to_string()),
+                max_results: 10,
+                layers: LayerMode::VamanaOnly,
+                ..Default::default()
+            };
+            match system.read().recall(&query) {
+                Ok(mems) => mems
+                    .iter()
+                    .map(|m| {
+                        (
+                            rev.get(&m.id.0).cloned().unwrap_or_else(|| m.id.0.to_string()),
+                            m.score.unwrap_or(0.0),
+                        )
+                    })
+                    .collect(),
+                Err(e) => panic!("recall failed: {e}"),
+            }
+        };
+
+        std::env::remove_var("SHODH_ACTR_FUSION");
+        let off = recall_order("brown fox meadow");
+        std::env::set_var("SHODH_ACTR_FUSION", "1");
+        let on = recall_order("brown fox meadow");
+        std::env::remove_var("SHODH_ACTR_FUSION");
+        let _ = std::fs::remove_dir_all(&storage);
+
+        eprintln!("VAMANA_ONLY  OFF (RRF)  : {off:?}");
+        eprintln!("VAMANA_ONLY  ON  (ACTR) : {on:?}");
+
+        let off_ids: Vec<&String> = off.iter().map(|(id, _)| id).collect();
+        let on_ids: Vec<&String> = on.iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            off_ids, on_ids,
+            "ACTR_FUSION changed the vamana_only ranking — the code said it could not.\n OFF={off:?}\n ON ={on:?}"
+        );
+    }
+
+    /// OBSERVATION (FUSION_V2): does Borda+rescue actually lift a graph-reachable
+    /// answer that RRF buries? Planted 2-hop: query entity Alice —(bridge)→ Bob;
+    /// gold "Bob discovered ..." is reachable via the graph but the lexical
+    /// distractor "Alice discovered ..." matches the query better. Print the order
+    /// and the gold's rank under RRF vs V2 — observe, don't assert.
+    #[test]
+    fn observe_fusion_v2_graph_rescue() {
+        use crate::recall_harness::fixtures::CorpusItem;
+        use chrono::{Duration, TimeZone, Utc};
+
+        let storage = unique_storage_dir("v2-observe");
+        let manager = build_manager(&storage).unwrap();
+        let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let mk = |id: &str, content: &str, i: i64| CorpusItem {
+            id: id.to_string(),
+            content: content.to_string(),
+            memory_type: "fact".to_string(),
+            tags: vec![],
+            created_at: base + Duration::minutes(i),
+        };
+        let mut corpus = vec![
+            mk("bridge", "Alice collaborates closely with Bob on their research", 0),
+            mk("gold", "Bob discovered a rare luminescent mineral inside the cave", 1),
+            mk("distract", "Alice discovered an ordinary grey rock out in the field", 2),
+        ];
+        // Many noise memories so a graph-only answer is genuinely OUTSIDE the
+        // hybrid top-`max_results` window (the rescue gate). Without this the
+        // rescue can never fire (corpus must exceed max_results).
+        for i in 0..24 {
+            corpus.push(mk(
+                &format!("noise{i:02}"),
+                &format!("Unrelated note number {i} about gardening, cooking, and travel plans"),
+                10 + i,
+            ));
+        }
+        let id_map = ingest_corpus(&manager, &corpus).unwrap();
+        let rev: HashMap<Uuid, String> =
+            id_map.iter().map(|(c, u)| (*u, c.clone())).collect();
+        let system = manager.get_user_memory(EVAL_USER).unwrap();
+
+        let recall_order = |q: &str| -> Vec<(String, f32)> {
+            let query = Query {
+                query_text: Some(q.to_string()),
+                max_results: 3,
+                layers: LayerMode::Full,
+                ..Default::default()
+            };
+            system
+                .read()
+                .recall(&query)
+                .map(|ms| {
+                    ms.iter()
+                        .map(|m| {
+                            (
+                                rev.get(&m.id.0).cloned().unwrap_or_else(|| m.id.0.to_string()),
+                                m.score.unwrap_or(0.0),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        let q = "What did Alice's collaborator discover?";
+        std::env::remove_var("SHODH_FUSION_V2");
+        let off = recall_order(q);
+        std::env::set_var("SHODH_FUSION_V2", "1");
+        let on = recall_order(q);
+        std::env::remove_var("SHODH_FUSION_V2");
+        let _ = std::fs::remove_dir_all(&storage);
+
+        let rank = |v: &Vec<(String, f32)>, id: &str| v.iter().position(|(i, _)| i == id);
+        eprintln!("FULL  OFF (RRF): {off:?}");
+        eprintln!("FULL  ON  (V2) : {on:?}");
+        eprintln!(
+            "gold rank  OFF={:?}  ON={:?}   distract rank OFF={:?} ON={:?}",
+            rank(&off, "gold"),
+            rank(&on, "gold"),
+            rank(&off, "distract"),
+            rank(&on, "distract"),
+        );
+    }
+
     #[test]
     fn experience_type_recognises_known_strings() {
         assert!(matches!(
