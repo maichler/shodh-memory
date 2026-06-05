@@ -2602,6 +2602,12 @@ impl GraphMemory {
         Ok(None)
     }
 
+    /// Total number of episodes stored in the graph (the `N` in PMI / IDF statistics).
+    /// O(1) — read from the maintained atomic counter.
+    pub fn total_episode_count(&self) -> usize {
+        self.episode_count.load(Ordering::Relaxed)
+    }
+
     /// Lightweight quality metrics for an existing entity in the graph.
     /// Used by NER filtering to suppress known stop-word entities.
     pub fn get_entity_reputation(&self, name: &str) -> Option<EntityReputation> {

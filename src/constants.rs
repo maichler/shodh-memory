@@ -244,6 +244,15 @@ pub const ENTITY_EMBEDDING_CACHE_MAX: usize = 10_000;
 /// Reference: Lund & Burgess (1996) "Producing high-dimensional semantic spaces"
 pub const EDGE_SEMANTIC_WEIGHT_FLOOR: f32 = 0.2;
 
+/// Minimum PMI-derived edge-weight multiplier. PMI (pointwise mutual information)
+/// weights an edge by how much MORE two entities co-occur than chance:
+/// `PMI = log2(co·N / (df_x·df_y))`, normalized by `log2(N)` into a [floor, 1] factor on
+/// the base edge strength. A ≤-chance pair has PPMI=0; this floor keeps a weak edge for any
+/// observed co-occurrence rather than deleting the association outright (a single
+/// co-occurrence is still weak evidence, not zero). Replaces the selectivity-IDF proxy as
+/// the principled, frequency-aware edge weighting (HippoRAG/GraphRAG edge statistics).
+pub const GRAPH_PMI_WEIGHT_FLOOR: f32 = 0.1;
+
 /// Whether to apply degree normalization during spreading activation.
 ///
 /// When true, outgoing activation per edge is divided by sqrt(1 + degree).
