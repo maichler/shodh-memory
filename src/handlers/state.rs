@@ -3211,14 +3211,16 @@ impl MultiUserMemoryManager {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-        // PMI edge weighting (default ON): weight each co-occurrence edge by pointwise
-        // mutual information so specific associations stay strong while incidental
-        // co-occurrence with a ubiquitous entity is born weak. Principled, frequency-aware
-        // replacement for the selectivity-IDF proxy; supersedes `idf_edges` when both set.
-        // Opt out with SHODH_GRAPH_PMI_EDGES=0.
+        // PMI edge weighting: weight each co-occurrence edge by pointwise mutual
+        // information so specific associations stay strong while incidental co-occurrence
+        // with a ubiquitous entity is born weak. Principled, frequency-aware replacement for
+        // the selectivity-IDF proxy; supersedes `idf_edges` when both set. Default OFF —
+        // measured neutral-to-slightly-negative (E3 multi-hop 0.4667→0.4500; LoCoMo flat
+        // across all categories). Kept behind SHODH_GRAPH_PMI_EDGES=1 for denser graphs /
+        // scale where hub suppression should pay off; not shipped as a default until it earns it.
         let pmi_edges: bool = std::env::var("SHODH_GRAPH_PMI_EDGES")
-            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-            .unwrap_or(true);
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         // N (total episodes) and its log (the PMI normalizer), read once outside the
         // O(n^2) pair loop. mention_count is the per-entity document-frequency proxy.
         let total_episodes = graph_guard.total_episode_count().max(1) as f32;
