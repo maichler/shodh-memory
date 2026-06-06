@@ -11,6 +11,7 @@ pub mod context;
 pub mod facts;
 pub mod feedback;
 pub mod files;
+pub mod gold_funnel;
 pub mod graph_retrieval;
 pub mod hybrid_search;
 pub mod injection;
@@ -2503,6 +2504,8 @@ impl MemorySystem {
             }
         };
 
+        crate::memory::gold_funnel::record("graph", graph_results.iter().map(|(id, _, _)| id));
+
         let t_graph = recall_start.elapsed();
         tracing::info!(
             graph_ms = format!("{:.2}", (t_graph - t_embedding).as_secs_f64() * 1000.0),
@@ -2602,6 +2605,7 @@ impl MemorySystem {
         } else {
             vr
         };
+        crate::memory::gold_funnel::record("vector", vector_results.iter().map(|(id, _)| id));
         let t_vector = recall_start.elapsed();
         tracing::info!(
             vector_ms = format!("{:.2}", (t_vector - t_graph).as_secs_f64() * 1000.0),
@@ -3383,6 +3387,7 @@ impl MemorySystem {
                 }
             }
 
+            crate::memory::gold_funnel::record("fusion", res.iter().map(|(id, _)| id));
             res.truncate(query.max_results);
             tracing::debug!("Layer 4: {} fused results", res.len());
 
@@ -4044,6 +4049,8 @@ impl MemorySystem {
 
             memories.truncate(query.max_results);
         }
+
+        crate::memory::gold_funnel::record("final", memories.iter().map(|m| &m.id));
 
         let t_total = recall_start.elapsed();
         tracing::info!(

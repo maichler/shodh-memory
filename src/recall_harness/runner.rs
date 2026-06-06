@@ -28,8 +28,8 @@ use super::fixtures::{
 use super::metrics::Metrics;
 use super::report::{
     aggregate_category, aggregate_layer, median, AblationReport, AblationRow, CategoryReport,
-    Failure, LayerReport, GraphStructure, LearningCurveArm, LearningCurveReport, PerCaseRecord,
-    ReachabilityCategory, ReachabilityReport, Report, SMOKE_K,
+    Failure, LayerReport, FunnelReport, FunnelStageRow, GraphStructure, LearningCurveArm,
+    LearningCurveReport, PerCaseRecord, ReachabilityCategory, ReachabilityReport, Report, SMOKE_K,
 };
 
 /// Embedder identifier emitted in the report. Matches the model wired into
@@ -859,6 +859,132 @@ pub fn analyze_ablation(inputs: &RunInputs) -> Result<AblationReport> {
         git_sha: inputs.git_sha.clone(),
         case_count: cases.len(),
         rows,
+    })
+}
+
+/// Per-stage gold-rank funnel diagnostic. Runs the suite under Full mode with the gold ids
+/// armed, recording at each pipeline-stage boundary (graph → vector → fusion → final) whether
+/// the gold is present and its best rank. Aggregates the per-stage drop-off so the step that
+/// loses reachable gold is LOCATED, not inferred (e.g. present after `graph`, absent after
+/// `fusion` ⇒ RRF is burying it).
+pub fn analyze_funnel(inputs: &RunInputs) -> Result<FunnelReport> {
+    pin_harness_threads();
+
+    let corpus_path = inputs
+        .corpus_path
+        .clone()
+        .unwrap_or_else(|| fixtures::manifest_path(SMOKE_CORPUS_PATH));
+    let cases_path = inputs
+        .cases_path
+        .clone()
+        .unwrap_or_else(|| fixtures::manifest_path(SMOKE_CASES_PATH));
+    let corpus = fixtures::load_corpus(&corpus_path)
+        .with_context(|| format!("loading corpus from {}", corpus_path.display()))?;
+    let cases = fixtures::load_smoke_cases(&cases_path)
+        .with_context(|| format!("loading cases from {}", cases_path.display()))?;
+    fixtures::validate_structure(&corpus, &cases)
+        .with_context(|| format!("{} suite failed structural validation", inputs.suite))?;
+
+    let manager = build_manager(&inputs.storage_path)?;
+    let id_map = ingest_corpus(&manager, &corpus)?;
+    let system = manager.get_user_memory(EVAL_USER)?;
+
+    let diag_k = std::env::var("RECALL_DIAG_K")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|k| *k >= SMOKE_K)
+        .unwrap_or(SMOKE_K);
+
+    const STAGES: [&str; 4] = ["graph", "vector", "fusion", "final"];
+
+    #[derive(Default, Clone)]
+    struct Acc {
+        seen: usize,
+        present: usize,
+        top_k: usize,
+        rank_sum: usize,
+    }
+    impl Acc {
+        fn record(&mut self, rank: Option<usize>) {
+            self.seen += 1;
+            if let Some(r) = rank {
+                self.present += 1;
+                self.rank_sum += r;
+                if r < SMOKE_K {
+                    self.top_k += 1;
+                }
+            }
+        }
+    }
+
+    let mut overall: BTreeMap<String, Acc> = BTreeMap::new();
+    let mut by_cat: BTreeMap<String, BTreeMap<String, Acc>> = BTreeMap::new();
+    let mut case_count = 0usize;
+
+    for case in &cases {
+        let gold: HashSet<MemoryId> = case
+            .relevant
+            .iter()
+            .filter_map(|r| id_map.get(&r.corpus_item_id).copied())
+            .map(MemoryId)
+            .collect();
+        if gold.is_empty() {
+            continue;
+        }
+        case_count += 1;
+        let cat = category_name(case.category).to_string();
+
+        let query = Query {
+            query_text: Some(case.query.clone()),
+            max_results: diag_k,
+            layers: crate::memory::types::LayerMode::Full,
+            ..Default::default()
+        };
+
+        crate::memory::gold_funnel::begin(gold.clone());
+        let _ = system.read().recall(&query);
+        let funnel = crate::memory::gold_funnel::take().unwrap_or_default();
+
+        for (stage, rank) in &funnel {
+            overall.entry(stage.clone()).or_default().record(*rank);
+            by_cat
+                .entry(cat.clone())
+                .or_default()
+                .entry(stage.clone())
+                .or_default()
+                .record(*rank);
+        }
+    }
+
+    let to_rows = |m: &BTreeMap<String, Acc>| -> Vec<FunnelStageRow> {
+        STAGES
+            .iter()
+            .filter_map(|s| m.get(*s).map(|a| (*s, a)))
+            .map(|(s, a)| {
+                let seen = a.seen.max(1) as f64;
+                FunnelStageRow {
+                    stage: s.to_string(),
+                    present_pct: 100.0 * a.present as f64 / seen,
+                    top10_pct: 100.0 * a.top_k as f64 / seen,
+                    mean_rank_when_present: if a.present == 0 {
+                        0.0
+                    } else {
+                        a.rank_sum as f64 / a.present as f64
+                    },
+                }
+            })
+            .collect()
+    };
+
+    let by_category: BTreeMap<String, Vec<FunnelStageRow>> =
+        by_cat.iter().map(|(c, m)| (c.clone(), to_rows(m))).collect();
+
+    Ok(FunnelReport {
+        suite: inputs.suite.clone(),
+        git_sha: inputs.git_sha.clone(),
+        case_count,
+        overall: to_rows(&overall),
+        by_category,
     })
 }
 

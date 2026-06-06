@@ -25,7 +25,7 @@ use shodh_memory::recall_harness::report::{
     ReachabilityReport, Report, SelectiveForgettingReport,
 };
 use shodh_memory::recall_harness::runner::{
-    analyze_ablation, analyze_graph_reachability, analyze_learning_curve,
+    analyze_ablation, analyze_funnel, analyze_graph_reachability, analyze_learning_curve,
     run_smoke_suite_with_ranks, ReportWithRanks, RunInputs,
 };
 
@@ -181,6 +181,13 @@ struct Args {
     #[arg(long)]
     graph_reachability: Option<PathBuf>,
 
+    /// Per-stage gold-rank funnel: run the suite under Full mode tracking each case's gold
+    /// rank at every pipeline-stage boundary (graph → vector → fusion → final), and write a
+    /// `FunnelReport` localizing where reachable gold is dropped. The biggest stage-to-stage
+    /// drop in "gold in top-10%" is the culprit step (graph→fusion ⇒ RRF burial).
+    #[arg(long)]
+    funnel: Option<PathBuf>,
+
     /// Learning-curve diagnostic ("smarter with use"): when set, skip the recall
     /// run and instead repeatedly recall + reinforce each tracked query, writing
     /// a `LearningCurveReport` (gold rank/score per reinforcement cycle) to this
@@ -291,6 +298,19 @@ fn run(args: &Args) -> Result<i32> {
         let report = analyze_graph_reachability(&inputs).context("graph-reachability analysis")?;
         write_reachability(reach_path, &report)?;
         summarise_reachability(&report);
+        eprintln!(
+            "recall-eval: storage retained at {} (delete manually after inspection)",
+            storage_path.display()
+        );
+        return Ok(EXIT_PASS);
+    }
+
+    // Per-stage gold-rank funnel short-circuits the recall run entirely.
+    if let Some(funnel_path) = &args.funnel {
+        let report = analyze_funnel(&inputs).context("funnel analysis")?;
+        std::fs::write(funnel_path, serde_json::to_string_pretty(&report)?)
+            .with_context(|| format!("writing {}", funnel_path.display()))?;
+        summarise_funnel(&report);
         eprintln!(
             "recall-eval: storage retained at {} (delete manually after inspection)",
             storage_path.display()
@@ -835,6 +855,33 @@ fn summarise(report: &Report) {
 /// Resolve the current git SHA by shelling out. Returns an error rather
 /// than panicking so the binary can still produce a report when run from a
 /// non-git checkout (e.g. a release tarball).
+fn summarise_funnel(report: &shodh_memory::recall_harness::report::FunnelReport) {
+    use shodh_memory::recall_harness::report::FunnelStageRow;
+    println!(
+        "## Per-stage gold-rank funnel (suite={} sha={} cases={})",
+        report.suite, report.git_sha, report.case_count
+    );
+    let print_rows = |label: &str, rows: &[FunnelStageRow]| {
+        println!("\n### {label}");
+        println!("| stage | gold present% | gold in top-10% | mean rank (when present) |");
+        println!("| --- | --- | --- | --- |");
+        for r in rows {
+            println!(
+                "| {} | {:.1} | {:.1} | {:.1} |",
+                r.stage, r.present_pct, r.top10_pct, r.mean_rank_when_present
+            );
+        }
+    };
+    print_rows("ALL", &report.overall);
+    for (cat, rows) in &report.by_category {
+        print_rows(cat, rows);
+    }
+    println!(
+        "\nBiggest stage-to-stage drop in 'gold in top-10%' LOCATES where reachable gold is lost: \
+         a graph→fusion drop = RRF burial; a fusion→final drop = L5 scoring/competition."
+    );
+}
+
 fn current_git_sha() -> Result<String> {
     let out = Command::new("git")
         .args(["rev-parse", "HEAD"])

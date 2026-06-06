@@ -443,6 +443,31 @@ pub fn compare_to_baseline(
 /// if the stranded gold is graph-reachable, better activation/ranking will
 /// surface it; if it is not, the deficit is entity-extraction/graph-construction
 /// or a non-entity-mediated hop (a retrieval-reach problem the graph cannot fix).
+/// Per-stage gold-rank funnel. For each pipeline stage (graph → vector → fusion → final),
+/// the fraction of cases whose gold is present at all, the fraction with gold inside the
+/// top-K window, and the mean best-gold rank when present. The biggest drop between
+/// consecutive stages LOCATES where reachable gold is lost (e.g. present in `graph` but gone
+/// after `fusion` ⇒ RRF is burying it).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FunnelStageRow {
+    pub stage: String,
+    /// % of cases where any gold id appears anywhere in this stage's candidate list.
+    pub present_pct: f64,
+    /// % of cases where the best gold rank is inside the top-K (SMOKE_K) window.
+    pub top10_pct: f64,
+    /// Mean best-gold rank (0-based) across cases where gold is present at this stage.
+    pub mean_rank_when_present: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FunnelReport {
+    pub suite: String,
+    pub git_sha: String,
+    pub case_count: usize,
+    pub overall: Vec<FunnelStageRow>,
+    pub by_category: BTreeMap<String, Vec<FunnelStageRow>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReachabilityReport {
     pub suite: String,
