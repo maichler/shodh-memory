@@ -2940,13 +2940,14 @@ impl MemorySystem {
             let flat_fusion = std::env::var("SHODH_FUSION_FLAT")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
-            let vector_leg_w = hybrid_w
-                * std::env::var("SHODH_VECTOR_LEG_FRAC")
-                    .ok()
-                    .and_then(|s| s.parse::<f32>().ok())
-                    .unwrap_or(0.6)
-                    .clamp(0.0, 1.0);
-            let bm25_leg_w = (hybrid_w - vector_leg_w).max(0.0);
+            // Consensus weight for the MIN leg in the max-fusion (a candidate present in BOTH
+            // vector and BM25 gets a small bonus over one strong in a single leg). The MAX leg
+            // is what preserves a single-leg-strong gold from crowd dilution.
+            let flat_consensus = std::env::var("SHODH_FLAT_CONSENSUS")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.3)
+                .clamp(0.0, 1.0);
             let max_vec = hybrid_components
                 .values()
                 .map(|(_, v)| *v)
@@ -3033,12 +3034,18 @@ impl MemorySystem {
             // Hybrid (BM25+vector) leg.
             for (r, (id, hybrid_raw)) in hybrid_ids.iter().enumerate() {
                 let hybrid_rrf = if flat_fusion {
-                    // The flatten: independent calibrated vector + BM25 legs. A vector-strong
-                    // gold keeps its magnitude; BM25's lexical crowd can no longer RRF-bury it
-                    // inside a single pre-fused hybrid score.
+                    // The flatten, max-fusion form: per-candidate MAX of the calibrated
+                    // vector/BM25 legs (+ a small consensus bonus on the MIN). A candidate
+                    // strong in EITHER leg keeps a high score — so BM25's lexical crowd can't
+                    // dilute a vector-strong gold (multi_hop) and vector noise can't dilute a
+                    // BM25-exact gold (single_hop). A global weighted SUM can't serve both
+                    // (measured: monotonic multi_hop↔single_hop tradeoff); max preserves the
+                    // best signal per candidate.
                     let (bm25, vec) = hybrid_components.get(id).copied().unwrap_or((0.0, 0.0));
-                    vector_leg_w * (vec / max_vec).clamp(0.0, 1.0)
-                        + bm25_leg_w * (bm25 / max_bm).clamp(0.0, 1.0)
+                    let vn = (vec / max_vec).clamp(0.0, 1.0);
+                    let bn = (bm25 / max_bm).clamp(0.0, 1.0);
+                    let (hi, lo) = if vn >= bn { (vn, bn) } else { (bn, vn) };
+                    hybrid_w * (hi + flat_consensus * lo)
                 } else if v2_fusion {
                     // Borda: rank-1 ≈ full hybrid_w (scale-invariant, no crumb).
                     hybrid_w * ((n_hybrid - r as f32) / n_hybrid)
