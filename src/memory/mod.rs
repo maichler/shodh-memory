@@ -2963,6 +2963,26 @@ impl MemorySystem {
             // Consensus weight for the MIN leg in the max-fusion (a candidate present in BOTH
             // vector and BM25 gets a small bonus over one strong in a single leg). The MAX leg
             // is what preserves a single-leg-strong gold from crowd dilution.
+            // SHODH_LEG=bm25|vector|graph — isolate ONE retrieval leg to measure its
+            // STANDALONE recall (diagnostic, default unset = all legs). vector keeps
+            // only vector-retrieved candidates ranked by vector score; bm25 likewise;
+            // graph drops the hybrid pool entirely (graph candidates only). The graph
+            // loop below is skipped for bm25/vector.
+            let isolate_leg = std::env::var("SHODH_LEG").ok();
+            match isolate_leg.as_deref() {
+                Some("vector") => {
+                    hybrid_components.retain(|_, (_, v)| *v > 0.0);
+                    hybrid_components.values_mut().for_each(|c| c.0 = 0.0);
+                }
+                Some("bm25") => {
+                    hybrid_components.retain(|_, (b, _)| *b > 0.0);
+                    hybrid_components.values_mut().for_each(|c| c.1 = 0.0);
+                }
+                Some("graph") => hybrid_components.clear(),
+                _ => {}
+            }
+            let graph_leg_on = !matches!(isolate_leg.as_deref(), Some("bm25") | Some("vector"));
+
             let flat_consensus = std::env::var("SHODH_FLAT_CONSENSUS")
                 .ok()
                 .and_then(|s| s.parse::<f32>().ok())
@@ -2981,6 +3001,9 @@ impl MemorySystem {
 
             // Graph leg.
             for (r, (id, activation, h)) in graph_results.iter().enumerate() {
+                if !graph_leg_on {
+                    break; // SHODH_LEG=bm25|vector isolates the hybrid leg
+                }
                 let rrf_score = if v2_fusion {
                     // Borda (rank-1 ≈ full graph_w) + CONFIDENCE rescue: every graph
                     // candidate gets graph_w·(activation/max) added, so a strongly
