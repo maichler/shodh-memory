@@ -49,23 +49,21 @@ jobs:
           import json
           d = json.load(open('layers.json'))
           L = d.get('layers', {})
-          order = ['vamana-only', 'plus-spreading', 'plus-bm25', 'plus-rerank', 'plus-facts', 'full']
+          # report_key() is snake_case; include any unexpected keys so we never miss again
+          order = ['vamana_only', 'plus_spreading', 'plus_bm25', 'plus_rerank', 'plus_facts', 'full']
+          keys = [k for k in order if k in L] + [k for k in L if k not in order]
           def r(v):
               return v['recall@10'] if isinstance(v, dict) else v
           print("## Per-layer ablation — LoCoMo recall@10 (cumulative ladder)\n")
+          print(f"(layers map has {len(L)} stages: {list(L.keys())})\n")
           print("| stage | recall@10 | Δ vs prev |")
           print("| --- | --- | --- |")
           prev = None
-          shown = False
-          for k in order:
-              if k in L:
-                  rk = r(L[k]); shown = True
-                  delta = "" if prev is None else f"{rk-prev:+.4f}"
-                  print(f"| {k} | {rk:.4f} | {delta} |")
-                  prev = rk
-          if not shown:
-              print("layers keys:", list(L.keys()))
-              print("```\n" + json.dumps(d, indent=1)[:1200] + "\n```")
+          for k in keys:
+              rk = r(L[k])
+              delta = "" if prev is None else f"{rk-prev:+.4f}"
+              print(f"| {k} | {rk:.4f} | {delta} |")
+              prev = rk
           # per-category at full (where the loss concentrates)
           bc = d.get('by_category', {})
           if bc:
@@ -74,3 +72,11 @@ jobs:
               for c, v in sorted(bc.items()):
                   print(f"| {c} | {r(v):.4f} |")
           PY
+
+      - name: Upload layers.json
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: layer-ablation-json
+          path: layers.json
+          if-no-files-found: warn
