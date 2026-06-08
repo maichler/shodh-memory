@@ -13,6 +13,12 @@ name: nomic int8 confirmation — full corpus (MiniLM vs nomic@384)
 
 on:
   workflow_dispatch:
+  # One-shot registration trigger: a never-run, dispatch-only workflow on a
+  # non-default branch is not yet dispatchable via the API. This push trigger
+  # registers AND launches it on the experiment branch. Strip after it runs.
+  push:
+    paths: ['.github/workflows/nomic-confirm-int8.yml']
+    branches: [exp/ner-gliner-ablation]
 
 jobs:
   confirm:
