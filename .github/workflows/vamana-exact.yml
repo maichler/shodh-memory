@@ -6,8 +6,6 @@ name: vamana vs exact (index recall vs task recall)
 # this scale) and the embeddings are the ceiling — swapping the index won't help.
 
 on:
-  push:
-    branches: [exp/ner-gliner-ablation]
   workflow_dispatch:
 
 jobs:

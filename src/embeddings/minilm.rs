@@ -228,6 +228,13 @@ fn embedder_prefixes() -> (String, String) {
         .as_str()
     {
         "e5" | "e5-small" | "e5-small-v2" => ("query: ".to_string(), "passage: ".to_string()),
+        // bge-v1.5 / mxbai use a query-side retrieval instruction, no doc prefix.
+        "bge" | "bge-small" | "bge-small-en-v1.5" | "mxbai" | "mxbai-xsmall" => (
+            "Represent this sentence for searching relevant passages: ".to_string(),
+            String::new(),
+        ),
+        // gte is symmetric — no instruction prefix (same as default, made explicit).
+        "gte" | "gte-small" => (String::new(), String::new()),
         _ => (String::new(), String::new()),
     }
 }
