@@ -48,9 +48,9 @@ jobs:
       - name: recall — ACT-R activation
         run: SHODH_ACTR_FUSION=1 ./target/release/recall-eval --suite locomo --output actr.json --storage ./s-actr 2>&1 | tail -3
       - name: funnel — RRF baseline
-        run: ./target/release/recall-eval --suite locomo --funnel frrf.json --storage ./s-frrf 2>&1 | tail -3
+        run: set -o pipefail; ./target/release/recall-eval --suite locomo --output orrf.json --funnel frrf.json --storage ./s-frrf 2>&1 | tail -5
       - name: funnel — ACT-R activation
-        run: SHODH_ACTR_FUSION=1 ./target/release/recall-eval --suite locomo --funnel factr.json --storage ./s-factr 2>&1 | tail -3
+        run: set -o pipefail; SHODH_ACTR_FUSION=1 ./target/release/recall-eval --suite locomo --output oactr.json --funnel factr.json --storage ./s-factr 2>&1 | tail -5
 
       - name: Compare
         if: always()
