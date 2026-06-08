@@ -5,8 +5,6 @@ name: leg isolation (per-leg standalone recall)
 # embedder? — by running vector_only on MiniLM vs E5.
 
 on:
-  push:
-    branches: [exp/ner-gliner-ablation]
   workflow_dispatch:
 
 jobs:

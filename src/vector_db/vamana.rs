@@ -752,6 +752,15 @@ impl VamanaIndex {
             return Ok(Vec::new());
         }
 
+        // SHODH_VECTOR_EXACT=1 → bypass the Vamana ANN graph and return the TRUE
+        // k nearest neighbours by exact brute-force. Diagnostic: separates *index
+        // recall* (ANN vs exact, the number LanceDB/FAISS publish) from *task recall*
+        // (gold answers). If task recall is unchanged vs ANN, the index is faithful
+        // and the embeddings — not the index — are the ceiling.
+        if std::env::var("SHODH_VECTOR_EXACT").is_ok() {
+            return self.brute_force_search(query, k);
+        }
+
         // Check if graph is built
         if self.graph.read().is_empty() {
             return Err(anyhow!(
