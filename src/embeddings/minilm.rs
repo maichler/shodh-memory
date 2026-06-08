@@ -206,7 +206,12 @@ pub struct MiniLMEmbedder {
     lazy_model: OnceLock<Result<Arc<LazyModel>, String>>,
     /// Flag for simplified mode (no ONNX)
     simplified_mode: bool,
+    /// Final, stored embedding dimension (always the 384-dim edge envelope).
     dimension: usize,
+    /// Model's native hidden/output size used as the mean-pool stride. Equals
+    /// `dimension` for native-384 models; larger (768) for Matryoshka models
+    /// (nomic) that are pooled wide then truncated to `dimension`.
+    native_hidden: usize,
     /// Asymmetric instruction prefix prepended to QUERY text before encoding.
     /// Empty for symmetric models (MiniLM). Retrieval-tuned models like
     /// e5-small-v2 require `"query: "` / `"passage: "` to separate the query and
@@ -235,7 +240,32 @@ fn embedder_prefixes() -> (String, String) {
         ),
         // gte is symmetric — no instruction prefix (same as default, made explicit).
         "gte" | "gte-small" => (String::new(), String::new()),
+        // nomic-embed-text-v1.5 is asymmetric with task-instruction prefixes.
+        "nomic" | "nomic-embed-text" | "nomic-embed-text-v1.5" => (
+            "search_query: ".to_string(),
+            "search_document: ".to_string(),
+        ),
         _ => (String::new(), String::new()),
+    }
+}
+
+/// Resolve `(native_hidden, output_dim)` from `SHODH_EMBEDDER`.
+///
+/// Most 384-dim models output exactly the edge-envelope dimension, so
+/// `native_hidden == output_dim == 384` (byte-identical to before). Matryoshka
+/// models (nomic-embed-text-v1.5) emit a larger native hidden size (768) that we
+/// mean-pool at full width, then truncate to the first 384 dims and
+/// re-normalize — yielding big-model quality at the same 384-dim RAM/index cost.
+/// The truncate-then-renormalize order is required: Matryoshka guarantees the
+/// leading-prefix subspace is a valid embedding only after its own L2 norm.
+fn embedder_dims() -> (usize, usize) {
+    match std::env::var("SHODH_EMBEDDER")
+        .unwrap_or_default()
+        .to_lowercase()
+        .as_str()
+    {
+        "nomic" | "nomic-embed-text" | "nomic-embed-text-v1.5" => (768, 384),
+        _ => (384, 384),
     }
 }
 
@@ -425,11 +455,13 @@ impl MiniLMEmbedder {
         }
 
         let (query_prefix, doc_prefix) = embedder_prefixes();
+        let (native_hidden, dimension) = embedder_dims();
         let embedder = Self {
             config: config.clone(),
             lazy_model: OnceLock::new(),
             simplified_mode: false,
-            dimension: 384,
+            dimension,
+            native_hidden,
             query_prefix,
             doc_prefix,
         };
@@ -510,11 +542,13 @@ impl MiniLMEmbedder {
         tracing::warn!("    Tokenizer: {:?}", config.tokenizer_path);
 
         let (query_prefix, doc_prefix) = embedder_prefixes();
+        let (native_hidden, dimension) = embedder_dims();
         Ok(Self {
             config,
             lazy_model: OnceLock::new(),
             simplified_mode: true,
-            dimension: 384,
+            dimension,
+            native_hidden,
             query_prefix,
             doc_prefix,
         })
@@ -604,6 +638,49 @@ impl MiniLMEmbedder {
         Ok(embedding)
     }
 
+    /// Finalize a wide mean-pooled vector into the stored edge-envelope
+    /// embedding.
+    ///
+    /// Native-384 models (MiniLM/bge/gte/mxbai): scrub NaN/Inf → L2-normalize,
+    /// byte-identical to the prior path (no truncation, no layer-norm).
+    ///
+    /// Matryoshka models (nomic, `native_hidden > dimension`): scrub →
+    /// parameter-free LayerNorm over the FULL `native_hidden` width → truncate to
+    /// the leading `dimension` dims → L2-normalize. This is nomic's exact
+    /// reference recipe (`F.layer_norm(x, (hidden,))` with no learned affine, then
+    /// `x[:, :d]`, then `F.normalize`). Order is load-bearing: the layer-norm must
+    /// see all 768 dims, and the L2 norm must be the LAST step on the truncated
+    /// prefix, or the Matryoshka subspace is not a valid unit embedding.
+    fn finalize_pooled(&self, mut pooled: Vec<f32>) -> Vec<f32> {
+        for val in pooled.iter_mut() {
+            if val.is_nan() || val.is_infinite() {
+                *val = 0.0;
+            }
+        }
+
+        if self.native_hidden > self.dimension {
+            // Parameter-free LayerNorm across the full native width (nomic recipe).
+            let n = pooled.len() as f32;
+            let mean = pooled.iter().sum::<f32>() / n;
+            let var = pooled.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
+            let denom = (var + 1e-5).sqrt();
+            if denom > f32::EPSILON {
+                for val in &mut pooled {
+                    *val = (*val - mean) / denom;
+                }
+            }
+            pooled.truncate(self.dimension);
+        }
+
+        let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > f32::EPSILON && !norm.is_nan() {
+            for val in &mut pooled {
+                *val /= norm;
+            }
+        }
+        pooled
+    }
+
     /// Generate embedding using ONNX Runtime (production)
     ///
     /// Lazily loads the model on first call if not already loaded.
@@ -652,55 +729,60 @@ impl MiniLMEmbedder {
         let attention_mask_value = Value::from_array((vec![1, max_length], attention.clone()))?;
         let token_type_ids_value = Value::from_array((vec![1, max_length], token_type_ids))?;
 
+        // token_type_ids is optional: standard BERT exports (MiniLM/bge/gte/mxbai)
+        // declare it, but nomic-bert and other rotary-position models do not — and
+        // ORT rejects an input the graph never declared. Only bind it when present.
+        let wants_token_type = session
+            .inputs()
+            .iter()
+            .any(|i| i.name() == "token_type_ids");
+
         // Run inference
         tracing::debug!("ONNX: running inference...");
-        let outputs = session.run(ort::inputs![
-            "input_ids" => &input_ids_value,
-            "attention_mask" => &attention_mask_value,
-            "token_type_ids" => &token_type_ids_value,
-        ])?;
+        let outputs = if wants_token_type {
+            session.run(ort::inputs![
+                "input_ids" => &input_ids_value,
+                "attention_mask" => &attention_mask_value,
+                "token_type_ids" => &token_type_ids_value,
+            ])?
+        } else {
+            session.run(ort::inputs![
+                "input_ids" => &input_ids_value,
+                "attention_mask" => &attention_mask_value,
+            ])?
+        };
         tracing::debug!("ONNX: inference complete");
 
         // Extract embeddings
         let output_tensor = outputs[0].try_extract_tensor::<f32>()?;
         let (_shape, output_data) = output_tensor;
 
-        // Mean pooling over sequence dimension
-        let mut pooled = vec![0.0; self.dimension];
+        // Mean pooling over sequence dimension, at the model's native hidden
+        // size (the output stride). Equals `dimension` for native-384 models;
+        // wider for Matryoshka models (truncated in finalize_pooled).
+        let hidden = self.native_hidden;
+        let mut pooled = vec![0.0; hidden];
         let mut mask_sum = 0.0;
 
         for (seq_idx, &att) in attention.iter().enumerate() {
             if att == 1 {
                 for (dim_idx, pooled_val) in pooled.iter_mut().enumerate() {
-                    let idx = seq_idx * self.dimension + dim_idx;
+                    let idx = seq_idx * hidden + dim_idx;
                     *pooled_val += output_data[idx];
                 }
                 mask_sum += 1.0;
             }
         }
 
-        // Average and L2 normalize
+        // Average
         if mask_sum > 0.0 {
             for val in &mut pooled {
                 *val /= mask_sum;
             }
         }
 
-        // Handle NaN/Inf values that may come from model output
-        for val in pooled.iter_mut() {
-            if val.is_nan() || val.is_infinite() {
-                *val = 0.0;
-            }
-        }
-
-        let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > f32::EPSILON && !norm.is_nan() {
-            for val in &mut pooled {
-                *val /= norm;
-            }
-        }
-
-        Ok(pooled)
+        // Scrub NaN/Inf, Matryoshka-truncate to `dimension`, then L2 normalize.
+        Ok(self.finalize_pooled(pooled))
     }
 
     /// Generate embeddings for multiple texts in a single ONNX batch
@@ -775,32 +857,47 @@ impl MiniLMEmbedder {
         let token_type_ids_value =
             Value::from_array((vec![batch_size, max_length], token_type_ids))?;
 
+        // token_type_ids is optional — see generate_embedding_onnx. nomic-bert and
+        // other rotary-position exports omit it; ORT rejects undeclared inputs.
+        let wants_token_type = session
+            .inputs()
+            .iter()
+            .any(|i| i.name() == "token_type_ids");
+
         // Run batch inference
-        let outputs = session.run(ort::inputs![
-            "input_ids" => &input_ids_value,
-            "attention_mask" => &attention_mask_value,
-            "token_type_ids" => &token_type_ids_value,
-        ])?;
+        let outputs = if wants_token_type {
+            session.run(ort::inputs![
+                "input_ids" => &input_ids_value,
+                "attention_mask" => &attention_mask_value,
+                "token_type_ids" => &token_type_ids_value,
+            ])?
+        } else {
+            session.run(ort::inputs![
+                "input_ids" => &input_ids_value,
+                "attention_mask" => &attention_mask_value,
+            ])?
+        };
 
         // Extract embeddings - output shape is [batch_size, seq_length, hidden_size]
         let output_tensor = outputs[0].try_extract_tensor::<f32>()?;
         let (_shape, output_data) = output_tensor;
 
-        // Mean pooling for each item in batch
+        // Mean pooling for each item in batch, at the model's native hidden size
+        // (the output stride). Wider than `dimension` for Matryoshka models.
+        let hidden = self.native_hidden;
         let mut results = Vec::with_capacity(batch_size);
 
         for batch_idx in 0..batch_size {
-            let mut pooled = vec![0.0; self.dimension];
+            let mut pooled = vec![0.0; hidden];
             let mut mask_sum = 0.0;
 
-            let batch_offset = batch_idx * max_length * self.dimension;
+            let batch_offset = batch_idx * max_length * hidden;
             let attention_offset = batch_idx * max_length;
 
             for seq_idx in 0..max_length {
                 if attention_masks[attention_offset + seq_idx] == 1 {
-                    for (dim_idx, pooled_val) in pooled.iter_mut().enumerate().take(self.dimension)
-                    {
-                        let idx = batch_offset + seq_idx * self.dimension + dim_idx;
+                    for (dim_idx, pooled_val) in pooled.iter_mut().enumerate().take(hidden) {
+                        let idx = batch_offset + seq_idx * hidden + dim_idx;
                         *pooled_val += output_data[idx];
                     }
                     mask_sum += 1.0;
@@ -814,22 +911,8 @@ impl MiniLMEmbedder {
                 }
             }
 
-            // Handle NaN/Inf values
-            for val in pooled.iter_mut() {
-                if val.is_nan() || val.is_infinite() {
-                    *val = 0.0;
-                }
-            }
-
-            // L2 normalize
-            let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > f32::EPSILON && !norm.is_nan() {
-                for val in &mut pooled {
-                    *val /= norm;
-                }
-            }
-
-            results.push(pooled);
+            // Scrub NaN/Inf, Matryoshka-truncate to `dimension`, then L2 normalize.
+            results.push(self.finalize_pooled(pooled));
         }
 
         Ok(results)

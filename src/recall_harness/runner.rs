@@ -209,6 +209,66 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
         None => cases,
     };
 
+    // Optional deterministic CORPUS subsample for MAX-speed directional reads
+    // (SHODH_MAX_CORPUS=N). Unlike SHODH_MAX_CASES — which keeps the full corpus
+    // so each query still faces all distractors and recall stays comparable to
+    // full scale — this SHRINKS the distractor pool. Fewer distractors inflate
+    // recall and compress the gaps between candidates, so it is a directional
+    // speed knob ONLY (never the gated baseline); a winner picked here must be
+    // confirmed at full corpus scale. Safety invariant: every gold item
+    // referenced by the (already-subsampled) surviving cases is ALWAYS retained,
+    // so no case is silently zeroed — only non-gold distractors are strided down
+    // to fill the remaining budget. Original corpus order is preserved so
+    // conversation grouping (which drives graph co-occurrence edges) is intact.
+    let corpus = match std::env::var("SHODH_MAX_CORPUS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0 && n < corpus.len())
+    {
+        Some(n) => {
+            let gold: std::collections::HashSet<&str> = cases
+                .iter()
+                .flat_map(|c| c.relevant.iter().map(|r| r.corpus_item_id.as_str()))
+                .collect();
+            let total = corpus.len();
+            let gold_count = corpus.iter().filter(|it| gold.contains(it.id.as_str())).count();
+            let keep_distractors = n.saturating_sub(gold_count);
+            let distractor_total = total - gold_count;
+            let stride = if keep_distractors == 0 {
+                usize::MAX
+            } else {
+                (distractor_total / keep_distractors).max(1)
+            };
+            let mut seen_distractor = 0usize;
+            let mut kept_distractors = 0usize;
+            let reduced: Vec<_> = corpus
+                .into_iter()
+                .filter(|it| {
+                    if gold.contains(it.id.as_str()) {
+                        return true;
+                    }
+                    let take = kept_distractors < keep_distractors
+                        && seen_distractor % stride == 0;
+                    seen_distractor += 1;
+                    if take {
+                        kept_distractors += 1;
+                    }
+                    take
+                })
+                .collect();
+            tracing::info!(
+                "SHODH_MAX_CORPUS={n}: reduced corpus {} → {} ({} gold kept + {} distractors). \
+                 Directional only — recall inflates vs full scale.",
+                total,
+                reduced.len(),
+                gold_count,
+                kept_distractors
+            );
+            reduced
+        }
+        None => corpus,
+    };
+
     let repeats = inputs.repeats.max(1);
     // RH-8 (#270): default to `[Full]` when caller passed an empty vec so
     // the existing single-mode contract is preserved by construction.
