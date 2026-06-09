@@ -4176,10 +4176,19 @@ impl MemorySystem {
             .unwrap_or(false);
         if v2_single_sort || memories.len() > query.max_results {
             // Score desc → recency desc → MemoryId asc — deterministic competition cutoff.
+            // Quantize the score to 1e-6 before comparing: fused scores are accumulated
+            // by `+=` over a HashMap in non-deterministic iteration order, so f32
+            // non-associativity wobbles the last ULPs (~1e-9) and `total_cmp` would order
+            // otherwise-equal candidates differently run-to-run — flipping adjacent ranks
+            // before the created_at/id tie-breaks can fire (the harness's repeat-determinism
+            // gate caught exactly this). Rounding to 1e-6 (far above the ULP noise, far
+            // below the ~1e-5 score granularity) collapses the wobble into exact ties broken
+            // deterministically by recency then id. Metric-neutral: only sub-1e-6
+            // (effectively tied) candidates are reordered, never the top-k membership.
+            let q = |s: f32| (s * 1.0e6).round();
             memories.sort_by(|a, b| {
-                b.score
-                    .unwrap_or(0.0)
-                    .total_cmp(&a.score.unwrap_or(0.0))
+                q(b.score.unwrap_or(0.0))
+                    .total_cmp(&q(a.score.unwrap_or(0.0)))
                     .then_with(|| b.created_at.cmp(&a.created_at))
                     .then_with(|| a.id.cmp(&b.id))
             });
