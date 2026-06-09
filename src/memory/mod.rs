@@ -2998,6 +2998,23 @@ impl MemorySystem {
                 .and_then(|s| s.parse::<f32>().ok())
                 .unwrap_or(1.0)
                 .max(0.0);
+            // SHODH_FLAT_VEC_ABS: calibrate the vector leg by ABSOLUTE cosine confidence
+            // instead of within-query relative rank (vec/max_vec). Relative normalisation
+            // hands the top candidate 1.0 even when its cosine is mediocre, so on a query with
+            // no real semantic match vector-NOISE competes with the BM25-strong gold — the
+            // single_hop regression that a global vector-trust multiplier caused (run
+            // 27221406266). Absolute calibration zeroes weak-cosine candidates (< floor) so
+            // vector contributes ONLY where it is genuinely confident: query-adaptive without a
+            // query-type label (which multi_hop can't supply at runtime). Default off → FLAT
+            // unchanged. SHODH_FLAT_VEC_FLOOR sets the cosine below which vector is ignored.
+            let flat_vec_abs = std::env::var("SHODH_FLAT_VEC_ABS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let flat_vec_floor = std::env::var("SHODH_FLAT_VEC_FLOOR")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.3)
+                .clamp(0.0, 0.95);
             let max_vec = hybrid_components
                 .values()
                 .map(|(_, v)| *v)
@@ -3139,7 +3156,13 @@ impl MemorySystem {
                     // (measured: monotonic multi_hop↔single_hop tradeoff); max preserves the
                     // best signal per candidate.
                     let (bm25, vec) = hybrid_components.get(id).copied().unwrap_or((0.0, 0.0));
-                    let vn = (vec / max_vec).clamp(0.0, 1.0) * flat_vec_trust;
+                    let vn = if flat_vec_abs {
+                        // Absolute cosine confidence: a weak-cosine candidate (< floor) → ~0
+                        // and cannot displace a BM25-strong gold; a strong match competes fully.
+                        ((vec - flat_vec_floor) / (1.0 - flat_vec_floor)).clamp(0.0, 1.0)
+                    } else {
+                        (vec / max_vec).clamp(0.0, 1.0) * flat_vec_trust
+                    };
                     let bn = (bm25 / max_bm).clamp(0.0, 1.0);
                     let (hi, lo) = if vn >= bn { (vn, bn) } else { (bn, vn) };
                     hybrid_w * (hi + flat_consensus * lo)
