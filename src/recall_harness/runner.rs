@@ -1328,6 +1328,12 @@ pub fn analyze_graph_reachability(inputs: &RunInputs) -> Result<ReachabilityRepo
     fixtures::validate_structure(&corpus, &cases)
         .with_context(|| format!("{} suite failed structural validation", inputs.suite))?;
 
+    // Respect the same SHODH_MAX_CASES / SHODH_MAX_CORPUS caps as the recall and
+    // funnel paths, so the reachability graph matches the graph those runs
+    // measured (entity counts comparable to the 51%-present funnel) and ingest
+    // time is bounded. Unset env → full corpus, identical to prior behaviour.
+    let (cases, corpus) = apply_eval_caps(cases, corpus);
+
     let manager = build_manager(&inputs.storage_path)?;
     let id_map = ingest_corpus(&manager, &corpus)?;
     let ner = manager.get_neural_ner();
