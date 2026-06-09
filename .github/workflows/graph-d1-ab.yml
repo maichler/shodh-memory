@@ -47,11 +47,11 @@ jobs:
           [ -s "$MD/tokenizer.json" ]       || dl "$MD/tokenizer.json" "$B/tokenizer.json"
 
       - name: A recall — baseline
-        run: set -o pipefail; ./target/release/recall-eval --suite locomo --output a.json --storage ./s-a 2>&1 | tail -3
+        run: set -o pipefail; ./target/release/recall-eval --suite locomo --repeats 1 --output a.json --storage ./s-a 2>&1 | tail -3
       - name: B recall — spread-fix (D1)
-        run: set -o pipefail; SHODH_SPREAD_FIX=1 ./target/release/recall-eval --suite locomo --output b.json --storage ./s-b 2>&1 | tail -3
+        run: set -o pipefail; SHODH_SPREAD_FIX=1 ./target/release/recall-eval --suite locomo --repeats 1 --output b.json --storage ./s-b 2>&1 | tail -3
       - name: C recall — spread-fix + ACT-R fusion
-        run: set -o pipefail; SHODH_SPREAD_FIX=1 SHODH_ACTR_FUSION=1 ./target/release/recall-eval --suite locomo --output c.json --storage ./s-c 2>&1 | tail -3
+        run: set -o pipefail; SHODH_SPREAD_FIX=1 SHODH_ACTR_FUSION=1 ./target/release/recall-eval --suite locomo --repeats 1 --output c.json --storage ./s-c 2>&1 | tail -3
       - name: A funnel — baseline
         run: set -o pipefail; ./target/release/recall-eval --suite locomo --output oa.json --funnel fa.json --storage ./s-fa 2>&1 | tail -3
       - name: B funnel — spread-fix (D1)
