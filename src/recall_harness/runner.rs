@@ -1223,6 +1223,18 @@ pub fn analyze_funnel(inputs: &RunInputs) -> Result<FunnelReport> {
     let id_map = ingest_corpus(&manager, &corpus)?;
     let system = manager.get_user_memory(EVAL_USER)?;
 
+    // Same ingest→query boundary lever as run_one_pass — the funnel is a separate
+    // pass and silently skipped the rebuild (run 27262844551 funnel-arm gate).
+    if std::env::var("SHODH_VAMANA_QUALITY_REBUILD")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        system
+            .read()
+            .force_vector_quality_rebuild()
+            .context("vamana quality rebuild at the funnel ingest→query boundary")?;
+    }
+
     let diag_k = std::env::var("RECALL_DIAG_K")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
