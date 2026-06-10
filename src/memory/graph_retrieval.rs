@@ -1476,8 +1476,18 @@ pub fn spreading_activation_retrieve_with_stats(
         scored_memories.sort_by(|a, b| b.final_score.total_cmp(&a.final_score));
     }
 
-    // Step 7: Apply limit
-    scored_memories.truncate(query.max_results);
+    // Step 7: Apply limit. Default = query.max_results, which makes the graph leg a
+    // ~10-candidate leg fused against ~100-candidate vector/BM25 legs — reachable gold
+    // ranked 11+ by the leg's internal scoring never reaches fusion at all (funnel:
+    // graph leg emits ~51% of 98%-reachable gold). SHODH_GRAPH_LEG_K widens the leg's
+    // exit gate without changing scoring (unlike reach_inject, which flooded the leg
+    // with threshold-free reachability and measured harmful). Default unset → unchanged.
+    let graph_leg_k = std::env::var("SHODH_GRAPH_LEG_K")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&k| k > 0)
+        .unwrap_or(query.max_results);
+    scored_memories.truncate(graph_leg_k);
 
     stats.retrieval_time_us = start_time.elapsed().as_micros() as u64;
 
