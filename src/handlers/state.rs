@@ -3325,6 +3325,16 @@ impl MultiUserMemoryManager {
             .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
             .unwrap_or(true);
 
+        // Edge-typing provenance counters (the substrate's own scoreboard):
+        // how many edges each stage of the typing chain produced. Logged per
+        // memory at info so CI runs (RUST_LOG) can measure the typed fraction —
+        // the generic share is the substrate progress metric (audit: >80%
+        // CoOccurs). grep "edge typing provenance" in eval logs.
+        let mut typed_semantic = 0usize;
+        let mut typed_cue = 0usize;
+        let mut typed_pair = 0usize;
+        let mut untyped_generic = 0usize;
+
         for i in 0..entity_uuids.len() {
             for j in (i + 1)..entity_uuids.len() {
                 // Edge quality gate using graph reputation
@@ -3407,6 +3417,7 @@ impl MultiUserMemoryManager {
                     if !a_is_source {
                         std::mem::swap(&mut from_entity, &mut to_entity);
                     }
+                    typed_semantic += 1;
                     rt
                 } else if extract_predicates
                     && matches!(
@@ -3423,11 +3434,24 @@ impl MultiUserMemoryManager {
                             if !a_is_source {
                                 std::mem::swap(&mut from_entity, &mut to_entity);
                             }
+                            typed_cue += 1;
                             rt
                         }
-                        None => label_relation,
+                        None => {
+                            untyped_generic += 1;
+                            label_relation
+                        }
                     }
                 } else {
+                    if matches!(
+                        label_relation,
+                        crate::graph_memory::RelationType::CoOccurs
+                            | crate::graph_memory::RelationType::RelatedTo
+                    ) {
+                        untyped_generic += 1;
+                    } else {
+                        typed_pair += 1;
+                    }
                     label_relation
                 };
 
@@ -3458,6 +3482,16 @@ impl MultiUserMemoryManager {
             }
         }
         // Lock released here
+
+        if typed_semantic + typed_cue + typed_pair + untyped_generic > 0 {
+            tracing::info!(
+                semantic = typed_semantic,
+                cue = typed_cue,
+                pair_table = typed_pair,
+                generic = untyped_generic,
+                "edge typing provenance"
+            );
+        }
 
         Ok(())
     }
