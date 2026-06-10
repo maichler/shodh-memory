@@ -3152,10 +3152,97 @@ impl MemorySystem {
                 //               semantic-only (multi_hop shape → trust vector →max).
                 //               Unlike peakedness this measures the RELATION between
                 //               the legs, not one leg's shape alone.
+                //   fitted    — stage 2b: offline-fitted logistic gate over ELEVEN
+                //               pool features (run 27267533447: holdout AUC 0.756 on
+                //               a 70/30 case split; no single feature exceeded AUC
+                //               0.554 — both stage-1 features were individually among
+                //               the weakest, which is WHY stage 1 kept re-trading).
+                //               t = P(vector ranks this query's gold better than
+                //               BM25). CAVEAT: coefficients fitted on the LoCoMo
+                //               eval distribution (caps 300/1500); an A/B on the
+                //               same suite partially trains-on-eval — the gate is
+                //               single_hop holding, and stage 3 is the online refit
+                //               from feedback.
                 let adapt_feature = std::env::var("SHODH_ADAPT_FEATURE")
                     .unwrap_or_else(|_| "peak".to_string())
                     .to_ascii_lowercase();
-                let t = if adapt_feature == "agreement" {
+                let t = if adapt_feature == "fitted" {
+                    // (mu, sd, weight) per standardized feature, then bias — from
+                    // the run-27267533447 fit. Order must match `feats` below.
+                    const FIT: [(f32, f32, f32); 11] = [
+                        (2.77242, 1.87083, -0.301375),    // bm_peak
+                        (1.3841, 0.180661, -0.0212517),   // vec_peak
+                        (0.307389, 0.170755, -0.243719),  // agreement_top10
+                        (93.4129, 43.8602, -0.556471),    // max_bm
+                        (0.597371, 0.0823258, 0.236463),  // max_vec
+                        (106.897, 36.4931, 0.597537),     // n_bm_pos
+                        (31.4138, 7.54534, -0.881755),    // n_vec_pos
+                        (116.222, 38.3149, 0.582615),     // n_hybrid
+                        (9.90148, 0.987682, 0.304049),    // n_graph
+                        (0.358194, 0.0710801, 0.0264384), // graph_max_activation
+                        (54.1034, 16.0475, -0.571797),    // query_len
+                    ];
+                    const FIT_BIAS: f32 = -0.985886;
+                    let mut by_vec: Vec<(&MemoryId, f32)> = hybrid_components
+                        .iter()
+                        .filter(|(_, (_, v))| *v > 0.0)
+                        .map(|(id, (_, v))| (id, *v))
+                        .collect();
+                    let mut by_bm: Vec<(&MemoryId, f32)> = hybrid_components
+                        .iter()
+                        .filter(|(_, (b, _))| *b > 0.0)
+                        .map(|(id, (b, _))| (id, *b))
+                        .collect();
+                    by_vec.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                    by_bm.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                    let peak = |xs: &[(&MemoryId, f32)]| -> f32 {
+                        if xs.is_empty() {
+                            return 1.0;
+                        }
+                        let max = xs[0].1;
+                        let mean = xs.iter().map(|x| x.1).sum::<f32>() / xs.len() as f32;
+                        if mean > 1e-6 {
+                            max / mean
+                        } else {
+                            1.0
+                        }
+                    };
+                    let agreement = if by_vec.is_empty() || by_bm.is_empty() {
+                        0.0
+                    } else {
+                        let k10 = 10usize.min(by_vec.len()).min(by_bm.len()).max(1);
+                        let top_v: std::collections::HashSet<&MemoryId> =
+                            by_vec.iter().take(k10).map(|(id, _)| *id).collect();
+                        by_bm
+                            .iter()
+                            .take(k10)
+                            .filter(|(id, _)| top_v.contains(id))
+                            .count() as f32
+                            / k10 as f32
+                    };
+                    let graph_max_act = graph_results
+                        .iter()
+                        .map(|(_, a, _)| *a)
+                        .fold(0.0_f32, f32::max);
+                    let feats: [f32; 11] = [
+                        peak(&by_bm),
+                        peak(&by_vec),
+                        agreement,
+                        max_bm,
+                        max_vec,
+                        by_bm.len() as f32,
+                        by_vec.len() as f32,
+                        hybrid_components.len() as f32,
+                        graph_results.len() as f32,
+                        graph_max_act,
+                        query_text.len() as f32,
+                    ];
+                    let mut s = FIT_BIAS;
+                    for ((mu, sd, w), x) in FIT.iter().zip(feats) {
+                        s += w * (x - mu) / sd;
+                    }
+                    1.0 / (1.0 + (-s.clamp(-30.0, 30.0)).exp())
+                } else if adapt_feature == "agreement" {
                     let agree_k = env_w("SHODH_ADAPT_AGREE_K", 10.0).max(1.0) as usize;
                     let agree_lo = env_w("SHODH_ADAPT_AGREE_LO", 0.1);
                     let agree_hi = env_w("SHODH_ADAPT_AGREE_HI", 0.5);
@@ -3211,7 +3298,19 @@ impl MemorySystem {
                     let span = (adapt_peak_hi - adapt_peak_lo).max(1e-6);
                     ((adapt_peak_hi - bm_peak) / span).clamp(0.0, 1.0)
                 };
-                1.0 + (adapt_trust_max - 1.0) * t
+                // SHODH_ADAPT_SYMMETRIC=1: map t through [down-weight, up-weight]
+                // instead of boost-only — with a CALIBRATED probability (fitted),
+                // t < 0.5 is evidence the query is BM25-favored and the vector leg
+                // can justifiably be weakened below 1.0 (floored at 0.2 so vector
+                // never vanishes). Boost-only (default) is the stage-1 form.
+                let symmetric = std::env::var("SHODH_ADAPT_SYMMETRIC")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if symmetric {
+                    (1.0 + (adapt_trust_max - 1.0) * (2.0 * t - 1.0)).max(0.2)
+                } else {
+                    1.0 + (adapt_trust_max - 1.0) * t
+                }
             } else {
                 // No global vector-trust knob: 1.0 unless the per-query adaptive
                 // path is enabled (global scalars measured as a category tradeoff).
