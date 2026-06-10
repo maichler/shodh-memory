@@ -2544,6 +2544,78 @@ impl GraphMemory {
         Ok(true)
     }
 
+    /// PHRASE-LEVEL precision resolution: entities whose FULL (lowercased) name
+    /// occurs verbatim inside `text_lower`. The inverse of fuzzy lookup — instead
+    /// of asking "which entity does this fragment match?" (where "incident"
+    /// binds to an arbitrary hub), it asks "which entity names does the query
+    /// actually CONTAIN?" ("the selvic incident" ⊂ query ✓; "the selvic1
+    /// incident" ⊄ query ✗). Built for causal-walk seeding, where a wrong seed
+    /// injects a wrong chain's origins into the candidate pool. Names shorter
+    /// than `min_len` are skipped (stop-word-like entity names would match
+    /// everything); capped at `max` results, longest names first (most specific).
+    pub fn find_entities_contained_in_text(
+        &self,
+        text_lower: &str,
+        min_len: usize,
+        max: usize,
+    ) -> Result<Vec<EntityNode>> {
+        let mut hits: Vec<(usize, Uuid)> = {
+            let lowercase_index = self.entity_lowercase_index.read();
+            lowercase_index
+                .iter()
+                .filter(|(name, _)| name.len() >= min_len && text_lower.contains(name.as_str()))
+                .map(|(name, uuid)| (name.len(), *uuid))
+                .collect()
+        };
+        // Longest (most specific) first; deterministic tie-break by uuid.
+        hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let mut out = Vec::new();
+        for (_, uuid) in hits.into_iter().take(max) {
+            if let Some(ent) = self.get_entity(&uuid)? {
+                out.push(ent);
+            }
+        }
+        Ok(out)
+    }
+
+    /// STRICT entity resolution: tiers 1-3 only (exact / case-insensitive /
+    /// stemmed) — no substring or word-level fuzzing.
+    ///
+    /// Use this when the caller needs PRECISION over recall — e.g. seeds for
+    /// the causal-origin walk. The lineage diagnosis (2026-06-10) showed the
+    /// fuzzy tiers binding a fragmented query token ("incident") to an
+    /// arbitrary hub node, making the backward walk inject OTHER chains' roots
+    /// into the candidate pool and crowding the true root out of the top-10
+    /// (harness root-cause P@1 pinned at 0.0). Spreading-activation seeding
+    /// keeps the recall-oriented fuzzy resolver; precision consumers use this.
+    pub fn find_entity_by_name_strict(&self, name: &str) -> Result<Option<EntityNode>> {
+        let uuid = {
+            let index = self.entity_name_index.read();
+            index.get(name).copied()
+        };
+        if let Some(uuid) = uuid {
+            return self.get_entity(&uuid);
+        }
+        let name_lower = name.to_lowercase();
+        let uuid = {
+            let lowercase_index = self.entity_lowercase_index.read();
+            lowercase_index.get(&name_lower).copied()
+        };
+        if let Some(uuid) = uuid {
+            return self.get_entity(&uuid);
+        }
+        let stemmer = Stemmer::create(Algorithm::English);
+        let stemmed_name = Self::stem_entity_name(&stemmer, name);
+        let uuid = {
+            let stemmed_index = self.entity_stemmed_index.read();
+            stemmed_index.get(&stemmed_name).copied()
+        };
+        if let Some(uuid) = uuid {
+            return self.get_entity(&uuid);
+        }
+        Ok(None)
+    }
+
     /// Find entity by name (case-insensitive, O(1) lookup)
     ///
     /// Uses a multi-tier matching strategy:

@@ -2294,6 +2294,46 @@ impl MemorySystem {
                     }
                 }
 
+                // PRECISION seed set for the causal-origin walk: strict
+                // resolution only (exact / case-insensitive / stemmed — no
+                // substring or word-level fuzzing). Lineage diagnosis
+                // (2026-06-10): the fuzzy tiers bound a fragmented query token
+                // ("incident") to an arbitrary hub node, so the backward walk
+                // injected OTHER chains' roots and crowded the true root out of
+                // the top-10 (root-cause P@1 pinned at 0.0). Query-NER names
+                // (multiword, model-extracted) are included — they are exactly
+                // the phrases strict resolution needs.
+                let mut strict_walk_seeds: Vec<uuid::Uuid> = Vec::new();
+                {
+                    let mut seen: std::collections::HashSet<uuid::Uuid> =
+                        std::collections::HashSet::new();
+                    // Phrase-level: entities whose FULL name occurs verbatim in
+                    // the query. Token-level strict lookup is insufficient — the
+                    // POS tagger fragments multiword names ("the selvic
+                    // incident" → "selvic", "incident"), and fragments either
+                    // miss (strict) or bind to arbitrary hubs (fuzzy).
+                    let qt_lower = query_text.to_lowercase();
+                    if let Ok(contained) =
+                        g.find_entities_contained_in_text(&qt_lower, 5, 8)
+                    {
+                        for ent in contained {
+                            if seen.insert(ent.uuid) {
+                                strict_walk_seeds.push(ent.uuid);
+                            }
+                        }
+                    }
+                    // NER names (model-extracted, multiword-capable) via strict
+                    // lookup as a complement.
+                    let ner_names = query.ner_entities.as_deref().unwrap_or(&[]);
+                    for e in ner_names.iter().map(|s| s.as_str()) {
+                        if let Ok(Some(ent)) = g.find_entity_by_name_strict(e) {
+                            if seen.insert(ent.uuid) {
+                                strict_walk_seeds.push(ent.uuid);
+                            }
+                        }
+                    }
+                }
+
                 // Graph-driven cue expansion: collect the top-K strongest 1-hop
                 // neighbours of the resolved query entities as "bridges" to append
                 // to the BM25 query (see SHODH_GRAPH_EXPAND_K above).
@@ -2338,9 +2378,17 @@ impl MemorySystem {
                 // bridges — the root episode shares no lexical token with the
                 // effect-query, so this is what lets it surface on the BM25 leg.
                 // Requires causally-typed edges (SHODH_GRAPH_EXTRACTED_PREDICATES).
+                //
+                // DEFAULT ON (lineage diagnosis 2026-06-10): this flag was
+                // default-OFF, so the walk the lineage harness exists to measure
+                // never executed — root-cause P@1 was pinned at 0.0 through every
+                // upstream fix ("machinery exists but never runs" #6). It is
+                // cue-gated (origin-intent queries only) and now PRECISION-seeded
+                // (phrase-level entity containment, not fuzzy fragments).
+                // SHODH_CAUSAL_ORIGIN=0 disables.
                 let causal_origin = std::env::var("SHODH_CAUSAL_ORIGIN")
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false);
+                    .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+                    .unwrap_or(true);
                 if causal_origin {
                     const ORIGIN_CUES: &[&str] = &[
                         "root cause",
@@ -2358,8 +2406,13 @@ impl MemorySystem {
                     let qt = query_text.to_lowercase();
                     let cue_matched = ORIGIN_CUES.iter().any(|c| qt.contains(c));
                     let mut origins_found = 0usize;
-                    if cue_matched && !query_entities.is_empty() {
-                        if let Ok(origins) = g.trace_causal_origins(&query_entities, 8) {
+                    // PRECISION over recall for the walk: seed ONLY from
+                    // strictly-resolved entities. Fuzzy-resolved fragments
+                    // ("incident" → an arbitrary hub) made the walk inject
+                    // other chains' roots, burying the true root (the measured
+                    // lineage-zero ranking failure).
+                    if cue_matched && !strict_walk_seeds.is_empty() {
+                        if let Ok(origins) = g.trace_causal_origins(&strict_walk_seeds, 8) {
                             origins_found = origins.len();
                             for oid in origins {
                                 causal_origin_entities.push(oid);
@@ -2375,8 +2428,9 @@ impl MemorySystem {
                     // entity resolution vs cue match vs trace. Greppable in CI logs.
                     if std::env::var("SHODH_CAUSAL_ORIGIN_DEBUG").is_ok() {
                         eprintln!(
-                            "CAUSAL_FUNNEL qents={} cue={} origins={}",
+                            "CAUSAL_FUNNEL qents={} strict={} cue={} origins={}",
                             query_entities.len(),
+                            strict_walk_seeds.len(),
                             cue_matched,
                             origins_found
                         );

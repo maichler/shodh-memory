@@ -2010,6 +2010,34 @@ mod tests {
         drop(g);
 
         let system = manager.get_user_memory(EVAL_USER).expect("system");
+
+        // MUTATION PROBE: the full harness runs 5 mode passes (~600 queries)
+        // before Full and measures 0.0, while a fresh-storage Full query works.
+        // Replicate the harness's pre-Full query traffic, then re-check the walk
+        // and the Full recall — if they now fail, query-driven graph mutation
+        // (CoRetrieved edges / co-access strengthening) is the harness zero.
+        for mode in &crate::memory::types::LayerMode::ALL[..5] {
+            for case in _cases.iter() {
+                let q = crate::memory::types::Query {
+                    query_text: Some(case.query.clone()),
+                    max_results: 10,
+                    layers: *mode,
+                    ..Default::default()
+                };
+                let _ = system.read().recall(&q);
+            }
+        }
+        {
+            let g = graph.read();
+            let origins_after = g.trace_causal_origins(&[c], 8).expect("walk after traffic");
+            assert!(
+                origins_after.contains(&a),
+                "MUTATION CONFIRMED AT THE WALK: origins lost after {} pre-Full \
+                 queries (had them on fresh storage)",
+                _cases.len() * 5
+            );
+        }
+
         let query = crate::memory::types::Query {
             query_text: Some("What was the earliest origin behind the Selvic incident?".into()),
             max_results: 10,
@@ -2024,12 +2052,79 @@ mod tests {
         let root_rank = texts.iter().position(|t| t.contains("Polnar"));
         assert!(
             root_rank.is_some(),
-            "SCALE STAGE 5 FAIL: root memory absent from top-10 at {chains} chains \
-             — walked origins diluted by cross-chain lexical distractors. \
-             Retrieved: {texts:?}"
+            "MUTATION CONFIRMED AT USAGE: walk survives but root memory absent \
+             from Full top-10 after prior-mode traffic. Retrieved: {texts:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The FULL harness function, exactly as CI runs it (analyze_lineage builds
+    /// its own fixtures, runs all six layer modes, measures by uuid relevance).
+    /// CI measures 0.0 while every staged local repro passes — this localizes
+    /// whether the zero lives in the harness measurement plumbing / multi-mode
+    /// sequence or in the CI environment.
+    #[test]
+    fn lineage_harness_end_to_end_reproduces_ci() {
+        let dir = unique_storage_dir("lineage-harness-e2e");
+        let inputs = RunInputs {
+            storage_path: dir.clone(),
+            corpus_path: None,
+            cases_path: None,
+            suite: "lineage".into(),
+            git_sha: "local".into(),
+            repeats: 1,
+            layer_modes: vec![LayerMode::Full],
+            age_days: 0.0,
+        };
+        let report = crate::recall_harness::lineage_harness::analyze_lineage(&inputs, 60)
+            .expect("harness run");
+        for r in &report.rows {
+            eprintln!(
+                "  {} root P@1={:.3} r@10={:.3}",
+                r.layer, r.multihop_p_at_1, r.multihop_recall_at_10
+            );
+        }
+        // Measurement-plumbing dump: what did the harness think case
+        // lin-why-0005 retrieved, by corpus id? (rank lists persist in the
+        // lineage_run storage's ReportWithRanks — easier: re-run one pass here
+        // and read the rank list directly.)
+        {
+            let fixture_dir = dir.join("lineage_fixtures");
+            let run_inputs = RunInputs {
+                storage_path: dir.join("plumb_run"),
+                corpus_path: Some(fixture_dir.join("lineage_corpus.jsonl")),
+                cases_path: Some(fixture_dir.join("lineage_cases.jsonl")),
+                suite: "lineage".into(),
+                git_sha: "local".into(),
+                repeats: 1,
+                layer_modes: vec![LayerMode::Full],
+                age_days: 0.0,
+            };
+            let out = run_smoke_suite_with_ranks(&run_inputs).expect("plumb run");
+            if let Some(l) = out.ranks.iter().find(|l| l.case_id == "lin-why-0005") {
+                eprintln!("  PLUMB lin-why-0005 retrieved: {:?}", l.retrieved);
+            }
+            for (layer, records) in &out.per_case_by_layer {
+                if let Some(r) = records.iter().find(|r| r.case_id == "lin-why-0005") {
+                    eprintln!(
+                        "  PLUMB {layer} lin-why-0005 r@k={:.2} relevant={}/{} missed={:?}",
+                        r.recall_at_k, r.relevant_found, r.relevant_total, r.missed
+                    );
+                }
+            }
+        }
+        let full = report
+            .rows
+            .iter()
+            .find(|r| r.layer == "full")
+            .expect("full row");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            full.multihop_recall_at_10 > 0.0,
+            "HARNESS-LEVEL ZERO REPRODUCED LOCALLY: full-layer root-cause \
+             r@10 = 0 — the zero is in the harness path, not the CI environment"
+        );
     }
 
     #[test]
