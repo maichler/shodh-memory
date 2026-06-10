@@ -59,6 +59,9 @@ pub struct RetrievalEngine {
     /// Shared consolidation event buffer for introspection
     /// Records edge formation, strengthening, and pruning events
     consolidation_events: Option<Arc<RwLock<ConsolidationEventBuffer>>>,
+    /// One-shot guard for SHODH_VAMANA_QUALITY_REBUILD (bulk alpha-RNG rebuild
+    /// before first search). True once the check ran, regardless of outcome.
+    quality_rebuild_done: std::sync::atomic::AtomicBool,
 }
 
 /// Bidirectional mapping between memory IDs and vector IDs
@@ -197,6 +200,7 @@ impl RetrievalEngine {
             id_mapping: Arc::new(RwLock::new(id_mapping)),
             storage_path,
             consolidation_events,
+            quality_rebuild_done: std::sync::atomic::AtomicBool::new(false),
         };
 
         // ATOMIC STARTUP: Rebuild Vamana from RocksDB (single source of truth)
@@ -866,6 +870,7 @@ impl RetrievalEngine {
             };
 
         // Search vector index - fetch more candidates for chunk deduplication
+        self.maybe_quality_rebuild();
         let index = self.vector_index.read();
         let results = index
             .search(
@@ -941,6 +946,7 @@ impl RetrievalEngine {
         exclude_id: Option<&MemoryId>,
     ) -> Result<Vec<(MemoryId, f32)>> {
         // Search vector index - fetch more candidates to account for chunk deduplication
+        self.maybe_quality_rebuild();
         let index = self.vector_index.read();
         let results = index
             .search(embedding, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2)
@@ -1486,6 +1492,116 @@ impl RetrievalEngine {
             avg_strength: 0.0,
             potentiated_count: 0,
         }
+    }
+
+    /// SHODH_VAMANA_QUALITY_REBUILD=1 — one-shot bulk alpha-RNG rebuild before the
+    /// first search.
+    ///
+    /// Every production write path reaches the index through `add_vector()`, which
+    /// skips `robust_prune` (greedy top-k neighbors, distance-only back-edge
+    /// pruning). Even `rebuild_from_rocksdb()` re-adds vectors one at a time, so
+    /// the alpha-RNG construction (`build()`) never runs on a live index: the graph
+    /// is a greedy kNN graph that progressively loses the long-range edges greedy
+    /// search needs (documented 5-15% recall@10 loss). This hook rebuilds the graph
+    /// once with full Vamana construction, preserving vector composition exactly:
+    /// live vectors are collected in vector-id order with their memory ids from the
+    /// live mapping (chunk structure intact), bulk-built, remapped, and the new
+    /// mapping persisted to RocksDB so a later instant-startup stays consistent.
+    /// Default unset → no behavior change.
+    fn maybe_quality_rebuild(&self) {
+        use std::sync::atomic::Ordering;
+        if self.quality_rebuild_done.load(Ordering::Acquire) {
+            return;
+        }
+        let enabled = std::env::var("SHODH_VAMANA_QUALITY_REBUILD")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        // Mark done regardless of outcome: exactly one attempt per engine instance.
+        if self.quality_rebuild_done.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if !enabled {
+            return;
+        }
+        if let Err(e) = self.force_quality_rebuild() {
+            tracing::warn!(
+                "Vamana quality rebuild failed; continuing on incremental graph: {e}"
+            );
+        }
+    }
+
+    /// Bulk-rebuild the Vamana graph with full alpha-RNG construction.
+    /// See `maybe_quality_rebuild` for rationale and invariants.
+    fn force_quality_rebuild(&self) -> Result<()> {
+        let start = std::time::Instant::now();
+        // LOCK ORDERING: vector_index (1) before id_mapping (2)
+        let mut index = self.vector_index.write();
+        let incremental = index.incremental_insert_count();
+        if index.len() == 0 || incremental == 0 {
+            return Ok(());
+        }
+        // Position in extract_all_vectors() == vector id.
+        let all_vectors = index.extract_all_vectors();
+        // Live (vector_id, memory_id) pairs in deterministic vector-id order —
+        // soft-deleted vectors have no mapping entry, so this also compacts.
+        let mut pairs: Vec<(u32, MemoryId)> = {
+            let mapping = self.id_mapping.read();
+            mapping
+                .vector_to_memory
+                .iter()
+                .map(|(vid, mid)| (*vid, mid.clone()))
+                .collect()
+        };
+        pairs.sort_by_key(|(vid, _)| *vid);
+        let vectors: Vec<Vec<f32>> = pairs
+            .iter()
+            .filter_map(|(vid, _)| all_vectors.get(*vid as usize).cloned())
+            .collect();
+        if vectors.len() != pairs.len() {
+            return Err(anyhow::anyhow!(
+                "quality rebuild aborted: {} mapped vectors but {} extractable",
+                pairs.len(),
+                vectors.len()
+            ));
+        }
+        index.rebuild_from_vectors(vectors)?;
+        // New vector ids are positional: pairs[i] -> i. Regroup per memory to
+        // preserve chunked-embedding structure, then swap the mapping.
+        let mut per_memory: HashMap<MemoryId, Vec<u32>> = HashMap::new();
+        for (new_id, (_, memory_id)) in pairs.iter().enumerate() {
+            per_memory
+                .entry(memory_id.clone())
+                .or_default()
+                .push(new_id as u32);
+        }
+        {
+            let mut mapping = self.id_mapping.write();
+            mapping.clear();
+            for (memory_id, vector_ids) in &per_memory {
+                mapping.insert_chunks(memory_id.clone(), vector_ids.clone());
+            }
+        }
+        // Persist the new mapping so instant-startup (.vamana + RocksDB entries)
+        // stays consistent with the rebuilt ids.
+        let mut persist_failed = 0usize;
+        for (memory_id, vector_ids) in &per_memory {
+            if self
+                .storage
+                .update_vector_mapping(memory_id, vector_ids.clone())
+                .is_err()
+            {
+                persist_failed += 1;
+            }
+        }
+        info!(
+            vectors = pairs.len(),
+            memories = per_memory.len(),
+            was_incremental_inserts = incremental,
+            persist_failed,
+            elapsed_ms = format!("{:.1}", start.elapsed().as_secs_f64() * 1000.0),
+            "Vamana quality rebuild: bulk alpha-RNG construction replaced incremental graph"
+        );
+        Ok(())
     }
 
     /// Check if vector index needs rebuild and rebuild if necessary
