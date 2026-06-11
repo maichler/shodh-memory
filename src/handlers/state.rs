@@ -3153,17 +3153,16 @@ impl MultiUserMemoryManager {
         // deadlock class. Keyed by (name_i, name_j); the pair loop looks up in
         // its own (i < j) order.
         //
-        // DEFAULT OFF — measured Pareto on LoCoMo (runs 27289927295 + 27326218586:
-        // ALL +0.0044, multi_hop +0.0066, temporal +0.0141, bit-identical
-        // reproduce) but BLOCKED on the lineage flood: semrel typing multiplies
-        // cross-chain causal edges, worsening the origin-walk flooding
-        // (lineage_walk_survives_harness_scale fails with this default on;
-        // isolation 2026-06-11 — semrel was the only breaking flip of three).
-        // Flip together with the selective origin walk (scored top-k injection).
+        // DEFAULT ON (batched guard run 27348362950, real-NER arms): ALL
+        // 0.7124→0.7157, temporal +0.0141, no category down, lineage 0.983 —
+        // the two former blockers are fixed and regression-guarded: the
+        // origin-walk flood (fragment-bridge ingest mask + scored top-k,
+        // 9a977c9) and the cue/semantic precedence + fragment budget
+        // starvation (2f90434). SHODH_SEMANTIC_RELATIONS=0 disables.
         // =====================================================================
         let semantic_relations_on = std::env::var("SHODH_SEMANTIC_RELATIONS")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
         let mut semantic_pairs: HashMap<
             (String, String),
             (crate::graph_memory::RelationType, bool, f32),
