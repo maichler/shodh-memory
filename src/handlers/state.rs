@@ -3172,12 +3172,34 @@ impl MultiUserMemoryManager {
             if let Ok(system) = self.get_user_memory(user_id) {
                 if let Some(sys) = system.try_read() {
                     let embedder = sys.get_embedder();
+                    // Fragment mask over the SAME names Phase 2 will see. The
+                    // pair loop blocks fragments from typing, so embedding
+                    // fragment pairs here only burns the budget — measured
+                    // (lineage fixture, 2026-06-11): with NER fragments present
+                    // the 20-pair budget was exhausted before any real pair,
+                    // silently disabling semrel (Triggers=120/Causes=0 with
+                    // NER vs Triggers=66/Causes=54 without).
+                    let is_fragment: Vec<bool> = (0..all_entities.len())
+                        .map(|k| {
+                            let name_k = all_entities[k].0.to_lowercase();
+                            all_entities.iter().enumerate().any(|(m, other)| {
+                                m != k && {
+                                    let name_m = other.0.to_lowercase();
+                                    name_m.len() > name_k.len()
+                                        && name_m.contains(name_k.as_str())
+                                }
+                            })
+                        })
+                        .collect();
                     // Mirror the Phase-2 pair cap (20) so we never embed pairs
                     // the loop won't create edges for.
                     const MAX_SEMANTIC_PAIRS: usize = 20;
                     let mut budget = MAX_SEMANTIC_PAIRS;
                     'outer: for i in 0..all_entities.len() {
                         for j in (i + 1)..all_entities.len() {
+                            if is_fragment[i] || is_fragment[j] {
+                                continue;
+                            }
                             if budget == 0 {
                                 break 'outer;
                             }
@@ -3449,50 +3471,52 @@ impl MultiUserMemoryManager {
                 );
                 let mut from_entity = entity_uuids[i].1;
                 let mut to_entity = entity_uuids[j].1;
-                // Typing chain: semantic (Phase 1.9, embeds the actual pair
-                // sentence — most specific) → cue extractor → label-pair table.
-                // A semantic hit overrides even a non-generic label-pair rule:
-                // the sentence-level evidence beats a static type-pair default.
+                // Typing chain: cue extractor (exact lexical evidence — "x set y
+                // in motion" literally in the sentence) → semantic typer (embeds
+                // the pair sentence vs exemplars — a distributional GUESS) →
+                // label-pair table. The semantic typer originally outranked the
+                // cue extractor; that made edge TYPES platform-dependent — the
+                // quantized CI embedder put the lineage fixture's causal
+                // templates nearest "x created y" (CreatedBy, not causal) while
+                // the local embedder chose "x caused y" (causal), flipping the
+                // backward walk's reachability per platform (CI lineage 0.200 vs
+                // local 1.000 at the same commit, run 27342411453). Among
+                // sentence-level evidence, an exact cue match beats an
+                // embedding-argmax near the threshold; the semantic typer's job
+                // is COVERAGE beyond the cue list, not overriding it.
                 let semantic_hit = semantic_pairs
                     .get(&(entity_uuids[i].0.clone(), entity_uuids[j].0.clone()))
                     .cloned();
+                let cue_hit = if extract_predicates {
+                    crate::graph_memory::extract_directed_predicate(
+                        &experience.content,
+                        &entity_uuids[i].0,
+                        &entity_uuids[j].0,
+                    )
+                } else {
+                    None
+                };
                 let relation_type = if fragment_of_comention[i] || fragment_of_comention[j] {
                     // Fragment endpoint: never typed, never causal (see mask above).
                     typed_blocked_fragment += 1;
                     crate::graph_memory::RelationType::CoOccurs
+                } else if let Some((rt, a_is_source)) = cue_hit {
+                    // LINEAGE-ZERO FIX (repro: lineage_walk_survives_harness_scale):
+                    // the cue extractor was once gated behind the label-pair
+                    // table, so a confident-LOOKING pair guess suppressed
+                    // explicit causal text and the origin walk starved. It now
+                    // outranks both guess layers.
+                    if !a_is_source {
+                        std::mem::swap(&mut from_entity, &mut to_entity);
+                    }
+                    typed_cue += 1;
+                    rt
                 } else if let Some((rt, a_is_source, _sim)) = semantic_hit {
                     if !a_is_source {
                         std::mem::swap(&mut from_entity, &mut to_entity);
                     }
                     typed_semantic += 1;
                     rt
-                } else if extract_predicates {
-                    // LINEAGE-ZERO FIX (repro: lineage_walk_survives_harness_scale):
-                    // the cue extractor was gated to run ONLY when the label-pair
-                    // table returned a generic relation. A confident-LOOKING pair
-                    // guess ((Technology,Technology) → AlternativeTo from mere
-                    // co-mention) therefore suppressed explicit causal text ("x set
-                    // y in motion") — no causal edge was ever created and the
-                    // backward origin walk starved (root-cause P@1 0.0 at every
-                    // layer). Sentence-level evidence outranks static label-pair
-                    // defaults — the same precedence the semantic typer already has.
-                    match crate::graph_memory::extract_directed_predicate(
-                        &experience.content,
-                        &entity_uuids[i].0,
-                        &entity_uuids[j].0,
-                    ) {
-                        Some((rt, a_is_source)) => {
-                            if !a_is_source {
-                                std::mem::swap(&mut from_entity, &mut to_entity);
-                            }
-                            typed_cue += 1;
-                            rt
-                        }
-                        None => {
-                            untyped_generic += 1;
-                            label_relation
-                        }
-                    }
                 } else {
                     if matches!(
                         label_relation,
