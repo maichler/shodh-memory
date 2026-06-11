@@ -553,6 +553,35 @@ fn run_one_pass(
     // is actually built, then query the per-user `MemorySystem` (which now has a
     // populated graph wired in). The manager is kept alive for the whole pass.
     let manager = build_manager(storage_path)?;
+
+    // NER-backend gate (eval fidelity): every CI number before 2026-06-11 was
+    // silently measured on the rule-based fallback NER (census-shape proof,
+    // run 27342411453). Refuse to measure on it again — a harness that tests a
+    // different recognizer than production ships is not measuring the system.
+    // SHODH_ALLOW_FALLBACK_NER=1 is the explicit, visible escape hatch.
+    let ner_backend = if manager.get_neural_ner().is_fallback_mode() {
+        "fallback"
+    } else {
+        "neural"
+    };
+    eprintln!("NER_BACKEND={ner_backend}");
+    // cfg!(test) exemption: lib tests exercise the harness MACHINERY on
+    // runners that may lack the model; the gate protects MEASUREMENTS (the
+    // recall-eval binary is never cfg(test)).
+    if ner_backend == "fallback"
+        && !cfg!(test)
+        && !std::env::var("SHODH_ALLOW_FALLBACK_NER")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    {
+        anyhow::bail!(
+            "recall harness refusing to run on the FALLBACK NER (model not \
+             loaded) — results would not measure the shipped system. Provide \
+             the pinned model or set SHODH_ALLOW_FALLBACK_NER=1 to override \
+             visibly."
+        );
+    }
+
     let id_map = ingest_corpus(&manager, corpus)?;
     let system = manager.get_user_memory(EVAL_USER)?;
 

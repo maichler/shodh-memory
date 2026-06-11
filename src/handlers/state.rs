@@ -3540,7 +3540,12 @@ impl MultiUserMemoryManager {
                     }
                     typed_semantic += 1;
                     rt
-                } else if let Some((rt, a_is_source, support)) = (learned_pairs)
+                } else if let Some((rt, a_is_source, support)) = (learned_pairs
+                    // Per-APPLICATION cap: a learned mapping may type at most 2
+                    // edges per memory. The v1 rejection (run 27348362950) was
+                    // one mapping mass-applying to every cue-less co-mention in
+                    // sight; per-pair purity cannot see per-application volume.
+                    && typed_learned < 2)
                     .then(|| {
                         graph_guard
                             .lookup_learned_pair_relation(&entity_uuids[i].2, &entity_uuids[j].2)

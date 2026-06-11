@@ -69,6 +69,19 @@ fn label_key(label: &EntityLabel) -> String {
     format!("{label:?}")
 }
 
+/// Labels too generic to carry a learned relation default. The first
+/// measurement (batched guard run 27348362950) showed one label-pair
+/// mass-applying CreatedBy to 344 cue-less co-mentions (open_domain -0.067):
+/// catch-all labels make every co-mention look like the same "pair", so the
+/// purity gate sees a clean signal that is actually label poverty. Learned
+/// mappings require both endpoints to carry a SPECIFIC label.
+fn label_is_generic(label: &EntityLabel) -> bool {
+    matches!(
+        label,
+        EntityLabel::Concept | EntityLabel::Keyword | EntityLabel::Other(_)
+    )
+}
+
 /// Canonicalize an unordered label pair for stats keys. Returns
 /// (first, second, input_src_is_first): the two label keys in lexicographic
 /// order plus whether the FIRST argument landed in the first slot.
@@ -3296,6 +3309,11 @@ impl GraphMemory {
         dst_label: &EntityLabel,
         relation: &RelationType,
     ) -> Result<()> {
+        // Generic labels never participate (see label_is_generic) — refusing
+        // at RECORD time keeps the stats CF small and the signal honest.
+        if label_is_generic(src_label) || label_is_generic(dst_label) {
+            return Ok(());
+        }
         let (la, lb, src_is_a) = canonical_label_pair(src_label, dst_label);
         let key = format!("lp:{la}:{lb}:{}", relation.as_str());
         let mut stat: PairRelationStat = match self.db.get_cf(self.relation_stats_cf(), &key)? {
@@ -3348,8 +3366,12 @@ impl GraphMemory {
     /// table. Returns (relation, label_a_entity_is_source, support) for the
     /// caller's (label_a, label_b) mention order, or None.
     ///
-    /// Gates (each against a measured failure mode):
-    /// - support ≥ 3 — no single-observation generalization;
+    /// Gates (each against a measured failure mode; tightened after the first
+    /// measurement, batched guard run 27348362950, rejected v1 for
+    /// per-application over-generalization):
+    /// - NO generic labels (Concept/Keyword/Other) on either endpoint —
+    ///   catch-all labels made every co-mention one "pair" (CreatedBy 3→344);
+    /// - support ≥ 10 (was 3) — a mapping must be earned by real evidence mass;
     /// - purity ≥ 0.6 — a near-tie between relations stays generic (the
     ///   embedding-argmax platform-divergence lesson: never let a coin flip
     ///   pick semantics);
@@ -3360,14 +3382,18 @@ impl GraphMemory {
     ///   bridge class);
     /// - direction by ≥ 0.7 majority for cross-label pairs, mention order
     ///   otherwise.
+    /// The caller adds the per-APPLICATION cap (max learned edges per memory).
     pub fn lookup_learned_pair_relation(
         &self,
         label_a: &EntityLabel,
         label_b: &EntityLabel,
     ) -> Result<Option<(RelationType, bool, u64)>> {
+        if label_is_generic(label_a) || label_is_generic(label_b) {
+            return Ok(None);
+        }
         let (la, lb, a_is_canonical_a) = canonical_label_pair(label_a, label_b);
         let pair_total = self.read_stat_counter(&format!("lp_total:{la}:{lb}"))?;
-        if pair_total < 3 {
+        if pair_total < 10 {
             return Ok(None);
         }
         let prefix = format!("lp:{la}:{lb}:");
@@ -7696,8 +7722,9 @@ mod tests {
         let person = EntityLabel::Person;
         let org = EntityLabel::Organization;
 
-        // Below support: 2 observations → None.
-        for _ in 0..2 {
+        // Below support: 9 observations → None (threshold 10 after the v1
+        // rejection, run 27348362950).
+        for _ in 0..9 {
             graph
                 .record_relation_evidence(&person, &org, &RelationType::WorksAt)
                 .unwrap();
@@ -7707,7 +7734,7 @@ mod tests {
             .unwrap()
             .is_none());
 
-        // Third observation clears support: mapping earned, direction settled
+        // Tenth observation clears support: mapping earned, direction settled
         // (source = Person in all evidence), and it maps to the caller's
         // mention order in both argument orders.
         graph
@@ -7716,10 +7743,10 @@ mod tests {
         let (rt, a_is_source, support) = graph
             .lookup_learned_pair_relation(&person, &org)
             .unwrap()
-            .expect("mapping earned at support 3");
+            .expect("mapping earned at support 10");
         assert_eq!(rt, RelationType::WorksAt);
         assert!(a_is_source, "Person mentioned first is the source");
-        assert_eq!(support, 3);
+        assert_eq!(support, 10);
         let (_, a_is_source, _) = graph
             .lookup_learned_pair_relation(&org, &person)
             .unwrap()
@@ -7727,7 +7754,7 @@ mod tests {
         assert!(!a_is_source, "Org mentioned first is the target");
 
         // Purity gate: a near-tie between relations stays generic.
-        for _ in 0..3 {
+        for _ in 0..10 {
             graph
                 .record_relation_evidence(&person, &org, &RelationType::Manages)
                 .unwrap();
@@ -7737,24 +7764,40 @@ mod tests {
                 .lookup_learned_pair_relation(&person, &org)
                 .unwrap()
                 .is_none(),
-            "3 WorksAt vs 3 Manages = purity 0.5 → no mapping"
+            "10 WorksAt vs 10 Manages = purity 0.5 → no mapping"
         );
 
         // Causal exclusion: statistics may NEVER assign causal relations —
         // a defaulted causal edge is lineage poison (the fragment-bridge class).
-        let event = EntityLabel::Concept;
-        let other = EntityLabel::Technology;
-        for _ in 0..5 {
+        let event = EntityLabel::Event;
+        let tech = EntityLabel::Technology;
+        for _ in 0..12 {
             graph
-                .record_relation_evidence(&event, &other, &RelationType::Triggers)
+                .record_relation_evidence(&event, &tech, &RelationType::Triggers)
                 .unwrap();
         }
         assert!(
             graph
-                .lookup_learned_pair_relation(&event, &other)
+                .lookup_learned_pair_relation(&event, &tech)
                 .unwrap()
                 .is_none(),
             "causal relations must never be statistically defaulted"
+        );
+
+        // Generic-label exclusion: catch-all labels (Concept/Keyword/Other)
+        // never record and never map — the v1 mass-application vector.
+        let concept = EntityLabel::Concept;
+        for _ in 0..12 {
+            graph
+                .record_relation_evidence(&concept, &org, &RelationType::WorksAt)
+                .unwrap();
+        }
+        assert!(
+            graph
+                .lookup_learned_pair_relation(&concept, &org)
+                .unwrap()
+                .is_none(),
+            "generic labels must never carry learned mappings"
         );
     }
 
