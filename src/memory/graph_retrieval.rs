@@ -1094,11 +1094,13 @@ pub fn spreading_activation_retrieve_with_stats(
         let pred_w = std::env::var("SHODH_GRAPH_PREDICATE_WEIGHTS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        // SHODH_PPR_SPECIFICITY: node-specificity restart weighting (HippoRAG). A/B
-        // arm — default off until the LoCoMo recall guard confirms no regression.
+        // SHODH_PPR_SPECIFICITY: node-specificity restart weighting (HippoRAG).
+        // DEFAULT ON (run 27326218586): multi_hop +0.0066 both with and without
+        // semantic relations (arms B vs A and D vs C), zero regression anywhere.
+        // SHODH_PPR_SPECIFICITY=0 disables.
         let specificity = std::env::var("SHODH_PPR_SPECIFICITY")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
         tracing::info!(
             "🌐 Using Personalized PageRank ({} seed entities, specificity={})",
             activation_map.len(),

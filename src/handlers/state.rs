@@ -575,6 +575,44 @@ impl MultiUserMemoryManagerRotationHelper {
 }
 
 /// Multi-user memory manager - central state for the server
+/// SHODH_QUERY_NER — annotate a recall query with neural-NER entities so the
+/// graph leg seeds from the real recognizer instead of the POS heuristic (which
+/// measurably tags verbs/months as entities — query analysis audit 2026-06-10).
+///
+/// DEFAULT ON (run 27272612202: +0.005 recall@10 ALL, p@1 0.5167, no category
+/// regresses — the Pareto arm). SHODH_QUERY_NER=0 disables. No-op when the
+/// query has no text or NER finds nothing (fallback NER returns an error that
+/// is swallowed here, so a missing model degrades to the POS heuristic).
+/// Confidence-filtered (≥0.5), capped at 8 names to bound the seed budget.
+///
+/// Free function (not a method) so spawn_blocking closures can capture just the
+/// `Arc<NeuralNer>` instead of the whole manager.
+pub fn annotate_query_ner_with(ner: &NeuralNer, query: &mut crate::memory::types::Query) {
+    let enabled = std::env::var("SHODH_QUERY_NER")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
+    if !enabled {
+        return;
+    }
+    let Some(text) = query.query_text.as_deref() else {
+        return;
+    };
+    match ner.extract(text) {
+        Ok(entities) => {
+            let names: Vec<String> = entities
+                .into_iter()
+                .filter(|e| e.confidence >= 0.5 && e.text.trim().len() >= 2)
+                .map(|e| e.text)
+                .take(8)
+                .collect();
+            if !names.is_empty() {
+                query.ner_entities = Some(names);
+            }
+        }
+        Err(e) => tracing::debug!("query NER annotation failed: {e}"),
+    }
+}
+
 pub struct MultiUserMemoryManager {
     /// Per-user memory systems with LRU eviction
     pub user_memories: moka::sync::Cache<String, Arc<parking_lot::RwLock<MemorySystem>>>,
@@ -1766,36 +1804,12 @@ impl MultiUserMemoryManager {
         self.neural_ner.clone()
     }
 
-    /// SHODH_QUERY_NER=1 — annotate a recall query with neural-NER entities so
-    /// the graph leg seeds from the real recognizer instead of the POS
-    /// heuristic (which measurably tags verbs/months as entities — query
-    /// analysis audit 2026-06-10). No-op when the flag is unset, the query has
-    /// no text, or NER finds nothing. Confidence-filtered (≥0.5), capped at 8
-    /// names to bound the seed budget.
+    /// Annotate a recall query with neural-NER entities so the graph leg seeds
+    /// from the real recognizer instead of the POS heuristic (which measurably
+    /// tags verbs/months as entities — query analysis audit 2026-06-10).
+    /// Delegates to [`annotate_query_ner_with`]; see it for flag semantics.
     pub fn annotate_query_ner(&self, query: &mut crate::memory::types::Query) {
-        let enabled = std::env::var("SHODH_QUERY_NER")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if !enabled {
-            return;
-        }
-        let Some(text) = query.query_text.as_deref() else {
-            return;
-        };
-        match self.neural_ner.extract(text) {
-            Ok(entities) => {
-                let names: Vec<String> = entities
-                    .into_iter()
-                    .filter(|e| e.confidence >= 0.5 && e.text.trim().len() >= 2)
-                    .map(|e| e.text)
-                    .take(8)
-                    .collect();
-                if !names.is_empty() {
-                    query.ner_entities = Some(names);
-                }
-            }
-            Err(e) => tracing::debug!("query NER annotation failed: {e}"),
-        }
+        annotate_query_ner_with(&self.neural_ner, query)
     }
 
     /// Get keyword extractor for statistical term extraction
@@ -3129,7 +3143,7 @@ impl MultiUserMemoryManager {
         all_entities.truncate(entity_cap);
 
         // =====================================================================
-        // PHASE 1.9: SEMANTIC RELATION TYPING (SHODH_SEMANTIC_RELATIONS=1)
+        // PHASE 1.9: SEMANTIC RELATION TYPING (SHODH_SEMANTIC_RELATIONS)
         // Substrate increment 1 (#65): type entity-pair relations by embedding
         // the template-normalized pair sentence against cached relation-label
         // exemplars (relation_typer.rs). Embedding happens HERE, before the
@@ -3138,6 +3152,14 @@ impl MultiUserMemoryManager {
         // (graceful degradation) instead of risking the historical re-entrant
         // deadlock class. Keyed by (name_i, name_j); the pair loop looks up in
         // its own (i < j) order.
+        //
+        // DEFAULT OFF — measured Pareto on LoCoMo (runs 27289927295 + 27326218586:
+        // ALL +0.0044, multi_hop +0.0066, temporal +0.0141, bit-identical
+        // reproduce) but BLOCKED on the lineage flood: semrel typing multiplies
+        // cross-chain causal edges, worsening the origin-walk flooding
+        // (lineage_walk_survives_harness_scale fails with this default on;
+        // isolation 2026-06-11 — semrel was the only breaking flip of three).
+        // Flip together with the selective origin walk (scored top-k injection).
         // =====================================================================
         let semantic_relations_on = std::env::var("SHODH_SEMANTIC_RELATIONS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
