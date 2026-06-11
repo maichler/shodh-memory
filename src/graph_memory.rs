@@ -29,6 +29,7 @@ const CF_ENTITY_EPISODES: &str = "entity_episodes";
 const CF_NAME_INDEX: &str = "name_index";
 const CF_LOWERCASE_INDEX: &str = "lowercase_index";
 const CF_STEMMED_INDEX: &str = "stemmed_index";
+const CF_RELATION_STATS: &str = "relation_stats";
 
 const GRAPH_CF_NAMES: &[&str] = &[
     CF_ENTITIES,
@@ -40,7 +41,46 @@ const GRAPH_CF_NAMES: &[&str] = &[
     CF_NAME_INDEX,
     CF_LOWERCASE_INDEX,
     CF_STEMMED_INDEX,
+    CF_RELATION_STATS,
 ];
+
+/// Per-(label-pair, relation) evidence counter for the learned pair table
+/// (Stanford-1, PMI² relation mapping). `src_is_a` counts observations where
+/// the relation's SOURCE entity carried the canonically-first label.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PairRelationStat {
+    relation: RelationType,
+    count: u64,
+    src_is_a: u64,
+}
+
+impl PairRelationStat {
+    fn new(relation: RelationType) -> Self {
+        Self {
+            relation,
+            count: 0,
+            src_is_a: 0,
+        }
+    }
+}
+
+/// Stable key string for an entity label in relation-stats keys.
+fn label_key(label: &EntityLabel) -> String {
+    format!("{label:?}")
+}
+
+/// Canonicalize an unordered label pair for stats keys. Returns
+/// (first, second, input_src_is_first): the two label keys in lexicographic
+/// order plus whether the FIRST argument landed in the first slot.
+fn canonical_label_pair(a: &EntityLabel, b: &EntityLabel) -> (String, String, bool) {
+    let ka = label_key(a);
+    let kb = label_key(b);
+    if ka <= kb {
+        (ka, kb, true)
+    } else {
+        (kb, ka, false)
+    }
+}
 
 /// Entity node in the knowledge graph
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3236,6 +3276,154 @@ impl GraphMemory {
                 .then_with(|| a.0.cmp(&b.0))
         });
         Ok(out)
+    }
+
+    fn relation_stats_cf(&self) -> &ColumnFamily {
+        self.db
+            .cf_handle(CF_RELATION_STATS)
+            .expect("relation_stats CF must exist")
+    }
+
+    /// Record one piece of high-precision relation evidence — the cue extractor
+    /// acting as distant supervisor (Angeli 2015 §5, adapted): every explicit
+    /// lexical cue hit teaches the per-user (label-pair → relation, direction)
+    /// statistics that `lookup_learned_pair_relation` later applies to cue-less
+    /// pairs. `src_label`/`dst_label` are the labels of the relation's source
+    /// and target entities respectively.
+    pub fn record_relation_evidence(
+        &self,
+        src_label: &EntityLabel,
+        dst_label: &EntityLabel,
+        relation: &RelationType,
+    ) -> Result<()> {
+        let (la, lb, src_is_a) = canonical_label_pair(src_label, dst_label);
+        let key = format!("lp:{la}:{lb}:{}", relation.as_str());
+        let mut stat: PairRelationStat = match self.db.get_cf(self.relation_stats_cf(), &key)? {
+            Some(bytes) => crate::serialization::try_decode(&bytes)
+                .map(|(s, _)| s)
+                .unwrap_or_else(|_| PairRelationStat::new(relation.clone())),
+            None => PairRelationStat::new(relation.clone()),
+        };
+        stat.count += 1;
+        if src_is_a {
+            stat.src_is_a += 1;
+        }
+        self.db.put_cf(
+            self.relation_stats_cf(),
+            &key,
+            crate::serialization::encode(&stat)?,
+        )?;
+        self.bump_stat_counter(&format!("lp_total:{la}:{lb}"))?;
+        self.bump_stat_counter(&format!("rel_total:{}", relation.as_str()))?;
+        self.bump_stat_counter("lp_grand_total")?;
+        Ok(())
+    }
+
+    fn bump_stat_counter(&self, key: &str) -> Result<()> {
+        let n: u64 = match self.db.get_cf(self.relation_stats_cf(), key)? {
+            Some(bytes) => crate::serialization::try_decode(&bytes)
+                .map(|(v, _)| v)
+                .unwrap_or(0),
+            None => 0,
+        };
+        self.db.put_cf(
+            self.relation_stats_cf(),
+            key,
+            crate::serialization::encode(&(n + 1))?,
+        )?;
+        Ok(())
+    }
+
+    fn read_stat_counter(&self, key: &str) -> Result<u64> {
+        Ok(match self.db.get_cf(self.relation_stats_cf(), key)? {
+            Some(bytes) => crate::serialization::try_decode(&bytes)
+                .map(|(v, _)| v)
+                .unwrap_or(0),
+            None => 0,
+        })
+    }
+
+    /// Learned label-pair relation for a cue-less pair: the typed default this
+    /// user's own cue evidence has EARNED, replacing the hardcoded label-pair
+    /// table. Returns (relation, label_a_entity_is_source, support) for the
+    /// caller's (label_a, label_b) mention order, or None.
+    ///
+    /// Gates (each against a measured failure mode):
+    /// - support ≥ 3 — no single-observation generalization;
+    /// - purity ≥ 0.6 — a near-tie between relations stays generic (the
+    ///   embedding-argmax platform-divergence lesson: never let a coin flip
+    ///   pick semantics);
+    /// - PMI² > 0 — the pair must co-occur with the relation MORE than chance
+    ///   (Angeli 2015 §5);
+    /// - NEVER causal — causal edges demand explicit sentence-level evidence;
+    ///   a statistically-defaulted causal edge is lineage poison (the fragment
+    ///   bridge class);
+    /// - direction by ≥ 0.7 majority for cross-label pairs, mention order
+    ///   otherwise.
+    pub fn lookup_learned_pair_relation(
+        &self,
+        label_a: &EntityLabel,
+        label_b: &EntityLabel,
+    ) -> Result<Option<(RelationType, bool, u64)>> {
+        let (la, lb, a_is_canonical_a) = canonical_label_pair(label_a, label_b);
+        let pair_total = self.read_stat_counter(&format!("lp_total:{la}:{lb}"))?;
+        if pair_total < 3 {
+            return Ok(None);
+        }
+        let prefix = format!("lp:{la}:{lb}:");
+        let iter = self
+            .db
+            .prefix_iterator_cf(self.relation_stats_cf(), prefix.as_bytes());
+        let mut best: Option<PairRelationStat> = None;
+        for (key, value) in iter.flatten() {
+            let Ok(key_str) = std::str::from_utf8(&key) else {
+                break;
+            };
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+            if let Ok((stat, _)) = crate::serialization::try_decode::<PairRelationStat>(&value) {
+                if best.as_ref().map(|b| stat.count > b.count).unwrap_or(true) {
+                    best = Some(stat);
+                }
+            }
+        }
+        let Some(best) = best else {
+            return Ok(None);
+        };
+        if best.relation.is_causal() {
+            return Ok(None);
+        }
+        let purity = best.count as f64 / pair_total as f64;
+        if purity < 0.6 {
+            return Ok(None);
+        }
+        let grand = self.read_stat_counter("lp_grand_total")?.max(1);
+        let rel_total = self
+            .read_stat_counter(&format!("rel_total:{}", best.relation.as_str()))?
+            .max(1);
+        // PMI² = log2( c(pair,rel)² · N / (c(pair) · c(rel)) ).
+        let pmi2 = ((best.count as f64).powi(2) * grand as f64
+            / (pair_total as f64 * rel_total as f64))
+            .log2();
+        if pmi2 <= 0.0 {
+            return Ok(None);
+        }
+        // Direction: majority vote across the evidence, expressed for the
+        // canonical pair, then mapped back to the caller's mention order.
+        let a_is_source = if la == lb {
+            true // same-label pairs carry no label-level direction signal
+        } else {
+            let ratio = best.src_is_a as f64 / best.count as f64;
+            if ratio >= 0.7 {
+                a_is_canonical_a
+            } else if ratio <= 0.3 {
+                !a_is_canonical_a
+            } else {
+                return Ok(None); // direction unsettled → stay generic
+            }
+        };
+        Ok(Some((best.relation.clone(), a_is_source, best.count)))
     }
 
     /// Count edges by relation type — the substrate's typed-fraction scoreboard
@@ -7388,6 +7576,75 @@ mod tests {
         let origins = graph.trace_causal_origins(&[c], 8).unwrap();
         assert_eq!(origins.len(), 1);
         assert_eq!(origins[0].0, a);
+    }
+
+    #[test]
+    fn learned_pair_relation_gates() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let person = EntityLabel::Person;
+        let org = EntityLabel::Organization;
+
+        // Below support: 2 observations → None.
+        for _ in 0..2 {
+            graph
+                .record_relation_evidence(&person, &org, &RelationType::WorksAt)
+                .unwrap();
+        }
+        assert!(graph
+            .lookup_learned_pair_relation(&person, &org)
+            .unwrap()
+            .is_none());
+
+        // Third observation clears support: mapping earned, direction settled
+        // (source = Person in all evidence), and it maps to the caller's
+        // mention order in both argument orders.
+        graph
+            .record_relation_evidence(&person, &org, &RelationType::WorksAt)
+            .unwrap();
+        let (rt, a_is_source, support) = graph
+            .lookup_learned_pair_relation(&person, &org)
+            .unwrap()
+            .expect("mapping earned at support 3");
+        assert_eq!(rt, RelationType::WorksAt);
+        assert!(a_is_source, "Person mentioned first is the source");
+        assert_eq!(support, 3);
+        let (_, a_is_source, _) = graph
+            .lookup_learned_pair_relation(&org, &person)
+            .unwrap()
+            .expect("swapped order still maps");
+        assert!(!a_is_source, "Org mentioned first is the target");
+
+        // Purity gate: a near-tie between relations stays generic.
+        for _ in 0..3 {
+            graph
+                .record_relation_evidence(&person, &org, &RelationType::Manages)
+                .unwrap();
+        }
+        assert!(
+            graph
+                .lookup_learned_pair_relation(&person, &org)
+                .unwrap()
+                .is_none(),
+            "3 WorksAt vs 3 Manages = purity 0.5 → no mapping"
+        );
+
+        // Causal exclusion: statistics may NEVER assign causal relations —
+        // a defaulted causal edge is lineage poison (the fragment-bridge class).
+        let event = EntityLabel::Concept;
+        let other = EntityLabel::Technology;
+        for _ in 0..5 {
+            graph
+                .record_relation_evidence(&event, &other, &RelationType::Triggers)
+                .unwrap();
+        }
+        assert!(
+            graph
+                .lookup_learned_pair_relation(&event, &other)
+                .unwrap()
+                .is_none(),
+            "causal relations must never be statistically defaulted"
+        );
     }
 
     #[test]

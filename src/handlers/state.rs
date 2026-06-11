@@ -3377,8 +3377,18 @@ impl MultiUserMemoryManager {
         let mut typed_semantic = 0usize;
         let mut typed_cue = 0usize;
         let mut typed_pair = 0usize;
+        let mut typed_learned = 0usize;
         let mut untyped_generic = 0usize;
         let mut typed_blocked_fragment = 0usize;
+
+        // SHODH_LEARNED_PAIRS: the learned label-pair table (Stanford-1, PMI²
+        // relation mapping) — every cue hit records (label-pair, relation,
+        // direction) evidence; cue-less pairs whose label-pair has EARNED a
+        // gated mapping get it instead of the static table / generic CoOccurs.
+        // A/B lever, default off until the batched CI guard run.
+        let learned_pairs: bool = std::env::var("SHODH_LEARNED_PAIRS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
         // MAXIMAL-MENTION mask: an entity whose name is a substring of a
         // CO-MENTIONED entity's name is a recognizer fragment of that mention
@@ -3505,7 +3515,21 @@ impl MultiUserMemoryManager {
                     // the cue extractor was once gated behind the label-pair
                     // table, so a confident-LOOKING pair guess suppressed
                     // explicit causal text and the origin walk starved. It now
-                    // outranks both guess layers.
+                    // outranks both guess layers — and acts as the DISTANT
+                    // SUPERVISOR for the learned pair table: each hit teaches
+                    // the per-user (label-pair → relation, direction) stats.
+                    if learned_pairs {
+                        let (src_label, dst_label) = if a_is_source {
+                            (&entity_uuids[i].2, &entity_uuids[j].2)
+                        } else {
+                            (&entity_uuids[j].2, &entity_uuids[i].2)
+                        };
+                        if let Err(e) =
+                            graph_guard.record_relation_evidence(src_label, dst_label, &rt)
+                        {
+                            tracing::debug!("relation evidence record failed: {e}");
+                        }
+                    }
                     if !a_is_source {
                         std::mem::swap(&mut from_entity, &mut to_entity);
                     }
@@ -3516,6 +3540,32 @@ impl MultiUserMemoryManager {
                         std::mem::swap(&mut from_entity, &mut to_entity);
                     }
                     typed_semantic += 1;
+                    rt
+                } else if let Some((rt, a_is_source, support)) = (learned_pairs)
+                    .then(|| {
+                        graph_guard
+                            .lookup_learned_pair_relation(&entity_uuids[i].2, &entity_uuids[j].2)
+                            .ok()
+                            .flatten()
+                    })
+                    .flatten()
+                {
+                    // The learned pair table: this user's own cue evidence has
+                    // earned a typed default for this label-pair (support ≥ 3,
+                    // purity ≥ 0.6, PMI² > 0, never causal, settled direction).
+                    // Outranks the static hand-written table — per-user data
+                    // beats global defaults (seed+adapt).
+                    if !a_is_source {
+                        std::mem::swap(&mut from_entity, &mut to_entity);
+                    }
+                    tracing::debug!(
+                        "learned pair: ({:?},{:?}) → {} (support {})",
+                        entity_uuids[i].2,
+                        entity_uuids[j].2,
+                        rt.as_str(),
+                        support
+                    );
+                    typed_learned += 1;
                     rt
                 } else {
                     if matches!(
@@ -3558,11 +3608,19 @@ impl MultiUserMemoryManager {
         }
         // Lock released here
 
-        if typed_semantic + typed_cue + typed_pair + untyped_generic + typed_blocked_fragment > 0 {
+        if typed_semantic
+            + typed_cue
+            + typed_pair
+            + typed_learned
+            + untyped_generic
+            + typed_blocked_fragment
+            > 0
+        {
             tracing::info!(
                 semantic = typed_semantic,
                 cue = typed_cue,
                 pair_table = typed_pair,
+                learned = typed_learned,
                 generic = untyped_generic,
                 fragment_blocked = typed_blocked_fragment,
                 "edge typing provenance"
