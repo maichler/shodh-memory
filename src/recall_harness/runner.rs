@@ -2019,6 +2019,65 @@ mod tests {
     /// passes end-to-end) must be scale-induced — dilution of the walked
     /// origin among cross-chain lexical distractors, or cross-chain entity
     /// resolution bleeding (substring tiers matching "Vornak" ↔ "Vornak2").
+    /// Typed-walk retrieval wiring (#67): a "where does X live" query must
+    /// retrieve the memory that placed X somewhere via a typed LocatedIn edge
+    /// — the lineage walk's machinery generalized to relation intents. The
+    /// planted sentence is TEMPLATE-EXACT against the semrel exemplar
+    /// ("x lives in y") so typing is platform-stable (the embedding-argmax
+    /// divergence lesson). Env-flag note: SHODH_TYPED_WALK is set/removed
+    /// around the recall; the cue gate ("where does") keeps it inert for any
+    /// concurrently-running test's queries.
+    #[test]
+    fn typed_walk_answers_located_in_query() {
+        let dir = unique_storage_dir("typed-walk");
+        let manager = build_manager(&dir).expect("manager");
+        let base = chrono::Utc::now();
+        let mut corpus: Vec<CorpusItem> = Vec::new();
+        corpus.push(CorpusItem {
+            id: "tw-gold".into(),
+            content: "Caroline lives in Denver.".into(),
+            memory_type: "fact".into(),
+            tags: vec![],
+            created_at: base,
+        });
+        // Lexical crowd: many Caroline memories so the gold has competition.
+        for i in 0..20 {
+            corpus.push(CorpusItem {
+                id: format!("tw-d{i:02}"),
+                content: format!("Caroline talked about topic number {i} for a while."),
+                memory_type: "fact".into(),
+                tags: vec![],
+                created_at: base + chrono::Duration::minutes(i as i64 + 1),
+            });
+        }
+        let id_map = ingest_corpus(&manager, &corpus).expect("ingest");
+        let gold_uuid = id_map.get("tw-gold").copied().expect("gold ingested");
+
+        let system = manager.get_user_memory(EVAL_USER).expect("system");
+        std::env::set_var("SHODH_TYPED_WALK", "1");
+        let results = system
+            .read()
+            .recall(&crate::memory::types::Query {
+                query_text: Some("Where does Caroline live now?".into()),
+                max_results: 10,
+                layers: LayerMode::Full,
+                ..Default::default()
+            })
+            .expect("recall");
+        std::env::remove_var("SHODH_TYPED_WALK");
+
+        let rank = results.iter().position(|m| m.id.0 == gold_uuid);
+        assert!(
+            rank.is_some(),
+            "typed walk must surface the LocatedIn memory in top-10; got: {:?}",
+            results
+                .iter()
+                .map(|m| m.experience.content.clone())
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression guard for the lineage flood (2026-06-11): NER fragment
     /// entities ("Mor", "wen") used to receive causal edges from the pair-typing
     /// loop, forming cross-document causal bridges that fused 57/60 chains

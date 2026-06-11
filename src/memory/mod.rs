@@ -2473,6 +2473,71 @@ impl MemorySystem {
                     }
                 }
 
+                // Typed-walk retrieval (SHODH_TYPED_WALK, #67): the causal-origin
+                // walk's machinery generalized to other relation intents. A
+                // typed-relation question ("Where does Caroline live?") is a
+                // triple with one unbound slot — (Caroline, LocatedIn, ?x) — and
+                // the typed substrate answers it by EDGE LOOKUP where BM25 and
+                // embeddings need lexical/semantic luck ("Caroline moved to
+                // Denver" shares nothing with "live"). V1 intents are the two
+                // relations the LoCoMo census shows the substrate actually
+                // carries (LocatedIn=166, CreatedBy well-typed); grow with
+                // typed_pct. Same discipline as the origin walk: strict maximal
+                // seeds, bounded top-k, scored injection — never a flood.
+                let typed_walk = std::env::var("SHODH_TYPED_WALK")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if typed_walk && !strict_walk_seeds.is_empty() {
+                    use crate::graph_memory::RelationType;
+                    // (intent name, query cues, relations, incoming) — incoming
+                    // follows neighbor --R--> seed (the seed is the OBJECT slot).
+                    let intents: &[(&str, &[&str], &[RelationType], bool)] = &[
+                        (
+                            "located",
+                            &[
+                                "where does", "where do", "where did", "where is", "where was",
+                                "where are", "live now", "lives now", "living now",
+                            ],
+                            &[RelationType::LocatedIn],
+                            false,
+                        ),
+                        (
+                            "creator",
+                            &[
+                                "who made", "who created", "who built", "who wrote",
+                                "who painted", "who designed", "who composed",
+                            ],
+                            &[RelationType::CreatedBy],
+                            true,
+                        ),
+                    ];
+                    let qt = query_text.to_lowercase();
+                    const TYPED_WALK_TOPK: usize = 3;
+                    for (intent, cues, relations, incoming) in intents {
+                        if !cues.iter().any(|c| qt.contains(c)) {
+                            continue;
+                        }
+                        let answers = g
+                            .typed_neighbors(&strict_walk_seeds, relations, *incoming, 64)
+                            .unwrap_or_default();
+                        let found = answers.len();
+                        for (aid, score) in answers.into_iter().take(TYPED_WALK_TOPK) {
+                            causal_origin_entities.push((aid, score));
+                            if let Ok(Some(ent)) = g.get_entity(&aid) {
+                                if ent.name.trim().len() >= 2 {
+                                    graph_bridges.push(ent.name);
+                                }
+                            }
+                        }
+                        if std::env::var("SHODH_TYPED_WALK_DEBUG").is_ok() {
+                            eprintln!(
+                                "TYPED_WALK intent={intent} seeds={} answers={found}",
+                                strict_walk_seeds.len()
+                            );
+                        }
+                    }
+                }
+
                 // Calculate PER-ENTITY density (not global graph density)
                 // Sparse entities = trust graph, Dense entities = trust vector
                 let d = if !query_entities.is_empty() {

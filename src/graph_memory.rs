@@ -3426,6 +3426,56 @@ impl GraphMemory {
         Ok(Some((best.relation.clone(), a_is_source, best.count)))
     }
 
+    /// Typed-relation neighbor lookup — the lineage walk's machinery as a
+    /// general retrieval primitive (typed-walk retrieval, #67). For each seed,
+    /// collect the entities connected by an edge whose relation type is in
+    /// `relations`, respecting direction: `incoming=false` follows
+    /// seed --R--> neighbor (e.g. Caroline --LocatedIn--> Denver for "where
+    /// does Caroline live"); `incoming=true` follows neighbor --R--> seed
+    /// (e.g. creator --CreatedBy--> artifact for "who made X"). Scored by
+    /// edge `effective_strength`, deduped by max, strongest first — the same
+    /// bounded-ranked-set discipline as the causal walk.
+    pub fn typed_neighbors(
+        &self,
+        seeds: &[Uuid],
+        relations: &[RelationType],
+        incoming: bool,
+        max_edges_per_seed: usize,
+    ) -> Result<Vec<(Uuid, f32)>> {
+        let mut best: HashMap<Uuid, f32> = HashMap::new();
+        for seed in seeds {
+            let edges = self.get_entity_relationships_limited(seed, Some(max_edges_per_seed))?;
+            for edge in &edges {
+                if !relations.contains(&edge.relation_type) {
+                    continue;
+                }
+                let neighbor = if incoming {
+                    if edge.to_entity != *seed || edge.from_entity == *seed {
+                        continue;
+                    }
+                    edge.from_entity
+                } else {
+                    if edge.from_entity != *seed || edge.to_entity == *seed {
+                        continue;
+                    }
+                    edge.to_entity
+                };
+                let score = edge.effective_strength().clamp(0.0, 1.0);
+                let entry = best.entry(neighbor).or_insert(0.0);
+                if score > *entry {
+                    *entry = score;
+                }
+            }
+        }
+        let mut out: Vec<(Uuid, f32)> = best.into_iter().collect();
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        Ok(out)
+    }
+
     /// Count edges by relation type — the substrate's typed-fraction scoreboard
     /// (audit 2026-06-10: >80% of the graph was CoOccurs; the typed fraction is
     /// the progress metric for the relation substrate). Full scan; intended for
@@ -7576,6 +7626,67 @@ mod tests {
         let origins = graph.trace_causal_origins(&[c], 8).unwrap();
         assert_eq!(origins.len(), 1);
         assert_eq!(origins[0].0, a);
+    }
+
+    #[test]
+    fn typed_neighbors_respects_relation_and_direction() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let caroline = Uuid::new_v4();
+        let denver = Uuid::new_v4();
+        let painting = Uuid::new_v4();
+        let melanie = Uuid::new_v4();
+        let mk = |from: Uuid, to: Uuid, rt: RelationType, strength: f32| RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: from,
+            to_entity: to,
+            relation_type: rt,
+            strength,
+            created_at: Utc::now(),
+            valid_at: Utc::now(),
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: Utc::now(),
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
+            tier: EdgeTier::L2Episodic,
+            entity_confidence: None,
+            forman_curvature: None,
+            endpoint_selectivity: None,
+        };
+        // Caroline --LocatedIn--> Denver; Melanie --CreatedBy--> painting;
+        // plus a CoOccurs distractor edge Caroline--painting.
+        graph
+            .add_relationship(mk(caroline, denver, RelationType::LocatedIn, 0.8))
+            .unwrap();
+        graph
+            .add_relationship(mk(melanie, painting, RelationType::CreatedBy, 0.9))
+            .unwrap();
+        graph
+            .add_relationship(mk(caroline, painting, RelationType::CoOccurs, 0.9))
+            .unwrap();
+
+        // Outgoing LocatedIn from Caroline → Denver only (CoOccurs filtered).
+        let out = graph
+            .typed_neighbors(&[caroline], &[RelationType::LocatedIn], false, 64)
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, denver);
+
+        // Incoming CreatedBy into the painting → Melanie (the creator).
+        let creators = graph
+            .typed_neighbors(&[painting], &[RelationType::CreatedBy], true, 64)
+            .unwrap();
+        assert_eq!(creators.len(), 1);
+        assert_eq!(creators[0].0, melanie);
+
+        // Wrong direction yields nothing: nobody is LocatedIn Caroline.
+        let incoming_loc = graph
+            .typed_neighbors(&[caroline], &[RelationType::LocatedIn], true, 64)
+            .unwrap();
+        assert!(incoming_loc.is_empty());
     }
 
     #[test]
