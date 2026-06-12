@@ -3572,6 +3572,32 @@ impl MemorySystem {
                     let mut by_graph: Vec<(&MemoryId, f32)> =
                         graph_results.iter().map(|(id, a, _)| (id, *a)).collect();
                     by_graph.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                    // Candidate-level training rows (roadmap ②): the union of
+                    // the three legs' pools with query-relative scores — the
+                    // exact calibrated inputs the FLAT fusion ranks with.
+                    let mut union: std::collections::HashMap<&MemoryId, (f32, f32, f32)> =
+                        std::collections::HashMap::new();
+                    for (id, (b, v)) in hybrid_components.iter() {
+                        let e = union.entry(id).or_insert((0.0, 0.0, 0.0));
+                        e.0 = (*v / max_vec).clamp(0.0, 1.0);
+                        e.1 = (*b / max_bm).clamp(0.0, 1.0);
+                    }
+                    let max_act = by_graph.first().map(|x| x.1).unwrap_or(0.0).max(1e-6);
+                    for (id, a) in by_graph.iter() {
+                        union.entry(id).or_insert((0.0, 0.0, 0.0)).2 =
+                            (*a / max_act).clamp(0.0, 1.0);
+                    }
+                    let candidates: Vec<crate::memory::fusion_features::CandidateRow> = union
+                        .into_iter()
+                        .map(|(id, (vec, bm25, graph))| {
+                            crate::memory::fusion_features::CandidateRow {
+                                vec,
+                                bm25,
+                                graph,
+                                is_gold: gold.contains(id),
+                            }
+                        })
+                        .collect();
                     FusionFeatures {
                         n_hybrid: hybrid_components.len(),
                         n_bm_pos: by_bm.len(),
@@ -3586,6 +3612,7 @@ impl MemorySystem {
                         gold_vec_rank: rank_of_gold(&by_vec),
                         gold_bm_rank: rank_of_gold(&by_bm),
                         gold_graph_rank: rank_of_gold(&by_graph),
+                        candidates,
                     }
                 });
             }

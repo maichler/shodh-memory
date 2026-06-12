@@ -26,6 +26,22 @@ struct ExportState {
     features: Option<FusionFeatures>,
 }
 
+/// One fused candidate's leg-component scores plus its relevance label — the
+/// training row for the per-leg calibration fit (roadmap ②, calibrated
+/// additive fusion). Scores are query-relative (each leg normalized by its
+/// own per-query max), i.e. exactly the calibrated inputs the FLAT fusion
+/// ranks with — the fit learns the mapping from THESE to P(relevant).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CandidateRow {
+    /// Query-relative vector score (v / max_vec); 0 = not in the vector pool.
+    pub vec: f32,
+    /// Query-relative BM25 score (b / max_bm); 0 = not in the BM25 pool.
+    pub bm25: f32,
+    /// Query-relative graph activation (a / max_activation); 0 = not reached.
+    pub graph: f32,
+    pub is_gold: bool,
+}
+
 /// Candidate-pool features visible to the fusion at rank time, plus per-leg
 /// gold ranks (the supervision signal for the offline trust fit).
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -51,6 +67,10 @@ pub struct FusionFeatures {
     pub gold_vec_rank: Option<usize>,
     pub gold_bm_rank: Option<usize>,
     pub gold_graph_rank: Option<usize>,
+    /// Candidate-level training rows (roadmap ②). Empty unless the export is
+    /// armed; serialized into the same JSONL the harness already writes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<CandidateRow>,
 }
 
 /// Arm the exporter for the next recall with this query's gold ids.
