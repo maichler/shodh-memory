@@ -3134,7 +3134,17 @@ impl MultiUserMemoryManager {
             .chain(issue_entities)
             .chain(concept_entities)
             .collect();
-        all_entities.sort_by(|a, b| b.1.salience.total_cmp(&a.1.salience));
+        // Salience ties MUST break on a total order (name): some entity groups
+        // are collected from HashMap iteration, whose order randomizes per
+        // instance. Without the tiebreak, the stable sort preserves that
+        // random order, so the cap truncation and the Phase-1.9 pair budget
+        // select a different entity/pair subset on every ingest of the same
+        // content — repeat-nondeterministic graphs (smoke-094).
+        all_entities.sort_by(|a, b| {
+            b.1.salience
+                .total_cmp(&a.1.salience)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         let entity_cap = if concepts_on {
             self.server_config.max_entities_per_memory.max(16)
         } else {

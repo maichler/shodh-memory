@@ -285,6 +285,17 @@ fn main() {
                 std::env::set_var(k, v);
             }
         }
+        // Freeze the scoring clock: repeat passes run minutes apart, and a
+        // live clock drifts the recency component enough to flip near-tie
+        // ranks between repeats (smoke-094 residual after thread pinning).
+        // Fixed anchor (not run-start) so baseline.json doesn't rot as the
+        // static corpus ages against a live clock.
+        if std::env::var_os("SHODH_EVAL_NOW").is_none() {
+            std::env::set_var(
+                "SHODH_EVAL_NOW",
+                shodh_memory::recall_harness::runner::HARNESS_CLOCK_ANCHOR,
+            );
+        }
     }
 
     // Opt-in tracing (RUST_LOG=shodh_memory=info): without a subscriber the

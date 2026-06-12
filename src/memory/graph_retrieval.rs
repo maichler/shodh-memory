@@ -1572,7 +1572,7 @@ pub fn spreading_activation_retrieve_with_stats(
         emb
     };
 
-    let now = chrono::Utc::now();
+    let now = crate::memory::scoring_now();
 
     for (_episode_uuid, (raw_activation, covered_seeds, episode)) in activated_memories {
         // G5: scale activation by distinct query-seed coverage. An episode

@@ -48,6 +48,25 @@ use crate::metrics::{
     EMBEDDING_CACHE_QUERY_SIZE,
 };
 
+/// Query-time scoring clock. `SHODH_EVAL_NOW` (RFC3339) freezes it for the
+/// recall harness: repeat passes minutes apart see different `Utc::now() -
+/// created_at` recency components, which is enough to flip near-tie ranks
+/// (smoke-094). The env value is parsed once per process; when unset
+/// (production), every call returns the live clock.
+pub(crate) fn scoring_now() -> chrono::DateTime<chrono::Utc> {
+    static PINNED: std::sync::OnceLock<Option<chrono::DateTime<chrono::Utc>>> =
+        std::sync::OnceLock::new();
+    PINNED
+        .get_or_init(|| {
+            std::env::var("SHODH_EVAL_NOW").ok().and_then(|raw| {
+                chrono::DateTime::parse_from_rfc3339(&raw)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            })
+        })
+        .unwrap_or_else(chrono::Utc::now)
+}
+
 use crate::constants::{
     DEFAULT_COMPRESSION_AGE_DAYS, DEFAULT_IMPORTANCE_THRESHOLD, DEFAULT_MAX_HEAP_PER_USER_MB,
     DEFAULT_SESSION_MEMORY_SIZE_MB, DEFAULT_WORKING_MEMORY_SIZE, EDGE_SEMANTIC_WEIGHT_FLOOR,
@@ -1418,7 +1437,7 @@ impl MemorySystem {
         self.expand_with_hierarchy(&mut memories, &mut seen_ids);
 
         // Rank by importance * temporal relevance
-        let now = chrono::Utc::now();
+        let now = scoring_now();
         memories.sort_by(|a, b| {
             let age_days_a = (now - a.created_at).num_days();
             let temporal_a = Self::calculate_temporal_relevance(age_days_a);
@@ -4225,7 +4244,7 @@ impl MemorySystem {
         // Layer 5: Unified scoring with hebbian + recency + emotional + feedback signals
         // All signals are multiplicative on the base score to preserve RRF ranking.
         // Formula: base × importance × (1 + recency + arousal + credibility + temporal) × feedback
-        let now = chrono::Utc::now();
+        let now = scoring_now();
 
         // PIPE-9: Get feedback store guard for momentum-based scoring
         // Acquire once outside the loop to avoid repeated locking
@@ -7029,6 +7048,13 @@ impl MemorySystem {
     /// Get BM25 segment count for health metrics
     pub fn bm25_segment_count(&self) -> usize {
         self.hybrid_search.bm25_segment_count()
+    }
+
+    /// BM25 commit batches lost after retries. Nonzero means the searchable
+    /// index is silently missing documents (read-your-writes broken) — the
+    /// recall harness treats that as an infrastructure failure.
+    pub fn bm25_commit_failure_count(&self) -> u64 {
+        self.hybrid_search.bm25_commit_failure_count()
     }
 
     /// Get vector index health information

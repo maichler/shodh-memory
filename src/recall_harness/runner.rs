@@ -831,8 +831,24 @@ fn pin_harness_threads() {
         if std::env::var_os("SHODH_RECALL_READONLY").is_none() {
             std::env::set_var("SHODH_RECALL_READONLY", "1");
         }
+        // Freeze the scoring clock. Repeat passes execute minutes apart; with
+        // a live clock the recency component of every score drifts between
+        // repeats, which is enough to flip near-tie adjacent ranks (smoke-094)
+        // and trip the determinism gate on noise unrelated to the code under
+        // test. The anchor is FIXED (not run-start) because corpus created_at
+        // values are static fixtures: a live anchor would also erode recency
+        // a little more every real day, silently rotting baseline.json until
+        // some near-tie flips weeks after it was generated.
+        if std::env::var_os("SHODH_EVAL_NOW").is_none() {
+            std::env::set_var("SHODH_EVAL_NOW", HARNESS_CLOCK_ANCHOR);
+        }
     }
 }
+
+/// The harness's frozen scoring clock (see `pin_harness_threads`). Must stay
+/// later than every `created_at` in the eval corpora (smoke max 2025-09-19,
+/// LoCoMo 2023, lineage fixtures 2024) so ages never go negative.
+pub const HARNESS_CLOCK_ANCHOR: &str = "2026-06-12T00:00:00Z";
 
 /// Construct an isolated `MemorySystem` rooted at `storage_path`.
 /// Single tenant the harness ingests under.
@@ -961,6 +977,24 @@ pub fn ingest_corpus(
             ),
             Err(e) => tracing::warn!("eval consolidation cycle failed: {e}"),
         }
+    }
+
+    // Read-your-writes integrity gate: a lost BM25 commit batch means the
+    // queries below would measure a partial index — recall numbers that
+    // depend on ambient machine state, not the code under test. Production
+    // tolerates the (retried, logged) loss for availability; the eval must
+    // not. Root-caused 2026-06-12: an external process locking fresh tantivy
+    // segment files under the user-profile Documents tree (search indexer /
+    // antivirus class) made 432/432 smoke comparisons diverge, silently.
+    let bm25_lost = user_mem.read().bm25_commit_failure_count();
+    if bm25_lost > 0 {
+        anyhow::bail!(
+            "BM25 index lost {bm25_lost} commit batch(es) during ingest after retries — \
+             the searchable index is missing documents and recall measurements would be \
+             invalid. Common cause: eval storage under a directory watched by a search \
+             indexer, antivirus, or sync daemon (e.g. the user-profile Documents tree). \
+             Move --storage to an unwatched location such as %LOCALAPPDATA%."
+        );
     }
 
     Ok(map)
