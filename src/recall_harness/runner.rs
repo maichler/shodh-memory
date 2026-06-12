@@ -823,6 +823,14 @@ fn pin_harness_threads() {
         if std::env::var_os("RAYON_NUM_THREADS").is_none() {
             std::env::set_var("RAYON_NUM_THREADS", "1");
         }
+        // Repeats measure variance, not learning curves: recall must not
+        // mutate usage state mid-eval. FLAT fusion made graph magnitude
+        // load-bearing, so first-repeat co-activation writes were shifting
+        // later repeats' rankings (L1 smoke non-determinism). Learning-curve
+        // experiments opt out by setting SHODH_RECALL_READONLY=0 explicitly.
+        if std::env::var_os("SHODH_RECALL_READONLY").is_none() {
+            std::env::set_var("SHODH_RECALL_READONLY", "1");
+        }
     }
 }
 

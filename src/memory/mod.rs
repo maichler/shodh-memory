@@ -1338,6 +1338,18 @@ impl MemorySystem {
     /// - Semantic search: Uses embeddings + vector similarity across ALL tiers
     /// - Non-semantic search: Uses importance * temporal decay
     /// - Zero shortcuts, no TODOs, enterprise-grade
+    /// SHODH_RECALL_READONLY=1 — recall performs no usage writes (access-count
+    /// persistence, co-retrieval edge creation). Set by the eval harness:
+    /// eval repeats measure variance, not learning curves, and FLAT fusion
+    /// made graph magnitude load-bearing, so first-repeat usage writes were
+    /// shifting later repeats' rankings (L1 smoke non-determinism,
+    /// PR #325 checks). Production default: writes on.
+    fn recall_readonly() -> bool {
+        std::env::var("SHODH_RECALL_READONLY")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    }
+
     pub fn recall(&self, query: &Query) -> Result<Vec<SharedMemory>> {
         Ok(self.recall_inner(query, false)?.memories)
     }
@@ -1433,23 +1445,26 @@ impl MemorySystem {
         // Update access counts (in-memory) + record consolidation events, then
         // persist all candidates' access bumps in ONE batched write instead of a
         // full re-index per candidate (the dominant old read-path cost).
-        let mut access_refs: Vec<(&Memory, f32)> = Vec::with_capacity(memories.len());
-        for memory in &memories {
-            let before =
-                self.update_access_count_instrumented(memory, StrengtheningReason::Recalled);
-            access_refs.push((memory.as_ref(), before));
-        }
-        if let Err(e) = self.long_term_memory.persist_access_updates(&access_refs) {
-            tracing::warn!("Failed to persist access updates: {e}");
-        }
+        if !Self::recall_readonly() {
+            let mut access_refs: Vec<(&Memory, f32)> = Vec::with_capacity(memories.len());
+            for memory in &memories {
+                let before =
+                    self.update_access_count_instrumented(memory, StrengtheningReason::Recalled);
+                access_refs.push((memory.as_ref(), before));
+            }
+            if let Err(e) = self.long_term_memory.persist_access_updates(&access_refs) {
+                tracing::warn!("Failed to persist access updates: {e}");
+            }
 
-        // Hebbian learning: co-activation strengthens associations between memories
-        // When memories are retrieved together, they form/strengthen edges in the memory graph
-        if memories.len() >= 2 {
-            if let Some(graph) = &self.graph_memory {
-                let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
-                if let Err(e) = graph.read().record_memory_coactivation(&memory_uuids) {
-                    tracing::trace!("Coactivation recording failed (non-critical): {e}");
+            // Hebbian learning: co-activation strengthens associations between
+            // memories. When memories are retrieved together, they
+            // form/strengthen edges in the memory graph.
+            if memories.len() >= 2 {
+                if let Some(graph) = &self.graph_memory {
+                    let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
+                    if let Err(e) = graph.read().record_memory_coactivation(&memory_uuids) {
+                        tracing::trace!("Coactivation recording failed (non-critical): {e}");
+                    }
                 }
             }
         }
@@ -4741,7 +4756,7 @@ impl MemorySystem {
         // RH-8 gate: access count mutates persistent state — only in `Full` mode.
         // Bump in-memory + record events, then persist all candidates' access
         // updates in ONE batched write rather than a full re-index per candidate.
-        if layer_full {
+        if layer_full && !Self::recall_readonly() {
             let mut access_refs: Vec<(&Memory, f32)> = Vec::with_capacity(memories.len());
             for memory in &memories {
                 let before =
@@ -4759,7 +4774,7 @@ impl MemorySystem {
         // participate in coactivation (biological: "neurons that fire together
         // wire together" but suppressed neurons don't fire).
         // RH-8 gate: Hebbian coactivation mutates graph state — only in `Full` mode.
-        if layer_full && memories.len() >= 2 {
+        if layer_full && !Self::recall_readonly() && memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
                 match graph.read().record_memory_coactivation(&memory_uuids) {
