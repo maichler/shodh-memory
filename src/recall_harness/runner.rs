@@ -2056,6 +2056,53 @@ mod tests {
     /// passes end-to-end) must be scale-induced — dilution of the walked
     /// origin among cross-chain lexical distractors, or cross-chain entity
     /// resolution bleeding (substring tiers matching "Vornak" ↔ "Vornak2").
+    /// Roadmap ② training-data export: runs the capped LoCoMo suite (Full
+    /// mode) with the fusion feature export armed, producing candidate-level
+    /// (vec, bm25, graph, is_gold) rows for the per-leg calibration fit.
+    /// Run explicitly:
+    ///   SHODH_MAX_CASES=300 SHODH_MAX_CORPUS=1500 cargo test --release \
+    ///     export_fusion_training_data -- --ignored --nocapture
+    #[test]
+    #[ignore = "training-data export — run explicitly"]
+    fn export_fusion_training_data() {
+        let dir = unique_storage_dir("fusion-export");
+        let out = dir.join("fusion_features.jsonl");
+        // SAFETY: process-wide env; run as a single explicit --ignored test.
+        unsafe {
+            std::env::set_var("SHODH_FUSION_FEATURE_EXPORT", &out);
+        }
+        let inputs = RunInputs {
+            storage_path: dir.join("run"),
+            corpus_path: Some(crate::recall_harness::fixtures::manifest_path(
+                crate::recall_harness::fixtures::LOCOMO_CORPUS_PATH,
+            )),
+            cases_path: Some(crate::recall_harness::fixtures::manifest_path(
+                crate::recall_harness::fixtures::LOCOMO_CASES_PATH,
+            )),
+            suite: "locomo".into(),
+            git_sha: "local".into(),
+            repeats: 1,
+            layer_modes: vec![LayerMode::Full],
+            age_days: 0.0,
+        };
+        let report = run_smoke_suite_with_ranks(&inputs).expect("export run");
+        unsafe {
+            std::env::remove_var("SHODH_FUSION_FEATURE_EXPORT");
+        }
+        let stable = std::path::Path::new("target/fusion_training.jsonl");
+        std::fs::copy(&out, stable).expect("copy export");
+        let lines = std::fs::read_to_string(stable).expect("read export");
+        let n = lines.lines().count();
+        eprintln!(
+            "EXPORT_WRITTEN {} queries={} cases_run={}",
+            stable.display(),
+            n,
+            report.ranks.len()
+        );
+        assert!(n > 0, "export produced no feature lines");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Typed-walk retrieval wiring (#67): a "where does X live" query must
     /// retrieve the memory that placed X somewhere via a typed LocatedIn edge
     /// — the lineage walk's machinery generalized to relation intents. The

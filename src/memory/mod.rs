@@ -4716,14 +4716,22 @@ impl MemorySystem {
                 })
                 .collect();
 
+            // Suppression COMPUTES in all modes (per-query ranking semantics);
+            // interference ACCUMULATION is a usage write — read-only recall
+            // (eval repeats) must not teach the detector (the records feed
+            // Layer 4.6's boosts on future queries; the third write class
+            // behind the L1 smoke cross-repeat divergence).
+            let record_state = !Self::recall_readonly();
             let competition_result = self
                 .interference_detector
                 .write()
-                .apply_retrieval_competition(&candidates, query_text);
+                .apply_retrieval_competition(&candidates, query_text, record_state);
 
             // Record competition event if any memories were suppressed
-            if let Some(ref event) = competition_result.event {
-                self.record_consolidation_event(event.clone());
+            if record_state {
+                if let Some(ref event) = competition_result.event {
+                    self.record_consolidation_event(event.clone());
+                }
             }
 
             // DEMOTE suppressed memories — never remove them. Deleting suppressed
