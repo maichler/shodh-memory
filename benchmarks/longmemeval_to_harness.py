@@ -41,6 +41,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from datetime import datetime, timezone
@@ -166,12 +167,25 @@ def main() -> None:
         default=None,
         help="only convert the first N scorable questions (cheap pilot)",
     )
+    ap.add_argument(
+        "--shuffle",
+        action="store_true",
+        help="deterministically reorder so any --limit prefix is a representative "
+        "category mix (the source is type-ordered)",
+    )
     args = ap.parse_args()
 
     with open(args.input, encoding="utf-8") as f:
         data = json.load(f)
     if isinstance(data, dict):  # some releases wrap in {"questions": [...]}
         data = data.get("questions", list(data.values()))
+
+    if args.shuffle:
+        # The source is type-ordered (all single-session questions first), so a
+        # naive --limit prefix would be all easy single-hop. Order by a stable
+        # hash of question_id: deterministic and reproducible, but any prefix is
+        # a representative mix of categories.
+        data.sort(key=lambda q: hashlib.md5(q["question_id"].encode()).hexdigest())
 
     stats = convert(data, args.out, args.limit)
     print(
