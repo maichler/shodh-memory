@@ -1927,6 +1927,7 @@ mod tests {
             entity_confidence: None,
             forman_curvature: None,
             endpoint_selectivity: None,
+            provenance: Vec::new(),
         };
         graph.add_relationship(mk_edge(hub, target_h)).unwrap();
         graph.add_relationship(mk_edge(rare, target_r)).unwrap();
@@ -2011,6 +2012,7 @@ mod tests {
                 entity_confidence: None,
                 forman_curvature: None,
                 endpoint_selectivity: None,
+                provenance: Vec::new(),
             })
             .unwrap();
 
